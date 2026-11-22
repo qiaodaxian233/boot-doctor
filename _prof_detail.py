@@ -78,9 +78,24 @@ timed("powershell 空跑（-Command 1）", lambda: subprocess.run(
 timed("wevtutil 启动（列出日志）", lambda: subprocess.run(
     ["wevtutil", "el"], capture_output=True, creationflags=nw))
 
-print("\n[整段]")
-timed("run_ps(PS_SYS)", lambda: bc.run_ps(bc.PS_SYS, timeout=120))
-timed("run_ps(PS_EVENTS)", lambda: bc.run_ps(bc.PS_EVENTS, timeout=180))
+print("\n[整段：旧 vs 新，各跑两轮（第一轮含冷启动）]")
+for rnd in (1, 2):
+    timed("第%d轮 旧 run_ps(PS_SYS)" % rnd, lambda: bc.run_ps(bc.PS_SYS, timeout=120))
+    if hasattr(bc, "sys_info_native"):
+        timed("第%d轮 新 sys_info_native()" % rnd, bc.sys_info_native)
+    if hasattr(bc, "PS_EVENTS_LEGACY"):
+        timed("第%d轮 旧 run_ps(PS_EVENTS_LEGACY)" % rnd,
+              lambda: bc.run_ps(bc.PS_EVENTS_LEGACY, timeout=180))
+    timed("第%d轮 新 run_ps(PS_EVENTS)" % rnd, lambda: bc.run_ps(bc.PS_EVENTS, timeout=180))
+
+if hasattr(bc, "sys_info_native"):
+    print("\n[原生采集分项]")
+    timed("服务状态 _svc_auto_stats", bc._svc_auto_stats)
+    timed("开机/登录任务 boot_logon_tasks_from_xml", bc.boot_logon_tasks_from_xml)
+    timed("磁盘健康 run_ps(PS_DISKS)", lambda: bc.run_ps(bc.PS_DISKS, timeout=60))
+    timed("卷 _volumes", bc._volumes)
+    timed("系统名/开机时间/内存", lambda: (bc._os_caption(), bc._boot_time_str(), bc._ram_gb()))
+
 time_ps_script("PS_SYS", bc.PS_SYS)
 time_ps_script("PS_EVENTS", bc.PS_EVENTS)
 

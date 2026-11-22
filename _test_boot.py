@@ -1461,5 +1461,77 @@ class TestUiPerf(unittest.TestCase):
             win.close()
 
 
+
+def _as_list(v):
+    if v is None:
+        return []
+    return v if isinstance(v, list) else [v]
+
+
+class TestNativeSysInfo(unittest.TestCase):
+    """原生采集（sys_info_native）必须和原来的 PS_SYS 结果一致：同一台机器上真跑两边对照。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ps = bc._parse_json(bc.run_ps(bc.PS_SYS, timeout=180)) or {}
+        cls.nat = bc.sys_info_native()
+
+    def test_basic_fields(self):
+        self.assertEqual(self.nat["build"], str(self.ps.get("build")))
+        self.assertAlmostEqual(self.nat["ramGB"], float(self.ps.get("ramGB") or 0), delta=0.2)
+        self.assertTrue(self.nat["osName"].startswith("Microsoft Windows"), self.nat["osName"])
+
+    def test_boot_time(self):
+        import datetime as _d
+        fmt = "%Y-%m-%d %H:%M:%S"
+        a = _d.datetime.strptime(self.nat["bootTime"], fmt)
+        b = _d.datetime.strptime(self.ps["bootTime"], fmt)
+        self.assertLessEqual(abs((a - b).total_seconds()), 120,
+                             "原生 %s / WMI %s" % (self.nat["bootTime"], self.ps["bootTime"]))
+
+    def test_services(self):
+        self.assertLessEqual(abs(self.nat["svcAuto"] - int(self.ps.get("svcAuto") or 0)), 3,
+                             "自动服务数 原生 %s / PS %s" % (self.nat["svcAuto"], self.ps.get("svcAuto")))
+        diff = set(self.nat["svcAutoDown"]) ^ set(_as_list(self.ps.get("svcAutoDown")))
+        self.assertLessEqual(len(diff), 3, "未运行的自动服务对不上：%s" % sorted(diff))
+
+    def test_volumes(self):
+        nat = {v["letter"]: v for v in self.nat["vols"]}
+        self.assertIn("C", nat)
+        for v in _as_list(self.ps.get("vols")):
+            if v.get("total") and v["letter"] in nat:
+                self.assertLessEqual(abs(nat[v["letter"]]["total"] - v["total"]), 1)
+
+    def test_disks(self):
+        key = lambda d: (d.get("name"), d.get("media"), d.get("health"))   # noqa: E731
+        self.assertEqual(sorted(map(key, self.nat["disks"])),
+                         sorted(map(key, _as_list(self.ps.get("disks")))))
+
+    def test_tasks(self):
+        if not bc.is_admin():
+            self.skipTest("读 System32\\Tasks 需要管理员；普通权限下走 PowerShell 兜底")
+        diff = set(self.nat["tasks"]) ^ set(_as_list(self.ps.get("tasks")))
+        self.assertLessEqual(len(diff), 5, "开机/登录任务对不上：%s" % sorted(diff)[:10])
+
+
+class TestEventsQuery(unittest.TestCase):
+    """新版 PS_EVENTS（服务端过滤）必须和旧版结果一致。"""
+
+    def test_new_matches_legacy(self):
+        new = bc._parse_json(bc.run_ps(bc.PS_EVENTS, timeout=180)) or {}
+        old = bc._parse_json(bc.run_ps(bc.PS_EVENTS_LEGACY, timeout=180)) or {}
+        for k in ("c7005", "c7005_7d", "c7005_1h", "c7023"):
+            self.assertEqual(int(new.get(k) or 0), int(old.get(k) or 0), k)
+        self.assertEqual(new.get("last7005") or "", old.get("last7005") or "")
+        # 旧版只在最近 800 条里找，新版直接按事件 ID 查，所以旧结果应是新结果的前缀
+        ob = [b.get("time") for b in _as_list(old.get("boots"))]
+        nb = [b.get("time") for b in _as_list(new.get("boots"))]
+        self.assertEqual(nb[:len(ob)], ob)
+        osl = [(x.get("id"), x.get("time"), x.get("name")) for x in _as_list(old.get("slow"))]
+        nsl = [(x.get("id"), x.get("time"), x.get("name")) for x in _as_list(new.get("slow"))]
+        self.assertEqual(nsl[:len(osl)], osl)
+        self.assertEqual([x.get("msg") for x in _as_list(new.get("scm"))],
+                         [x.get("msg") for x in _as_list(old.get("scm"))])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
