@@ -20,6 +20,7 @@ import base64
 import ctypes
 import datetime as _dt
 import json
+import ntpath
 import os
 import re
 import shlex
@@ -44,7 +45,7 @@ SEV_CN = {"high": "高", "mid": "中", "low": "低", "info": "提示"}
 SEV_ORDER = {"high": 0, "mid": 1, "low": 2, "info": 3}
 SEV_WEIGHT = {"high": 15, "mid": 8, "low": 3, "info": 0}
 
-CAT_ORDER = ["启动速度", "快速启动", "流氓软件", "开机自启", "延迟启动",
+CAT_ORDER = ["启动速度", "快速启动", "流氓软件", "浏览器劫持", "开机自启", "延迟启动",
              "服务与残留", "开机报错", "磁盘与其他"]
 
 HKLM = winreg.HKEY_LOCAL_MACHINE
@@ -63,6 +64,9 @@ FIX_DESC = {
     "startup_off": "禁止开机自启（任务管理器同款标记，条目保留、随时可恢复）",
     "startup_delete": "彻底删除自启项（删注册表值 / 启动文件夹快捷方式，原值或文件已备份）",
     "task_off": "禁用开机/登录触发的计划任务",
+    "reg_edit": "修改浏览器 / 网络相关的注册表设置（原值已备份，可还原）",
+    "hosts_clean": "从 hosts 文件里删掉被劫持的行（整个文件已备份，可还原）",
+    "lnk_args": "清掉浏览器快捷方式里被追加的网址（原快捷方式已备份，可还原）",
     "svc_delay": "服务改为『自动（延迟启动）』（仍会启动，只错开开机高峰）",
     "startup_delay": "改为延迟启动（创建登录后延迟的计划任务，并关闭原自启标记）",
     "delay_task_set": "修改已创建的延迟任务：按当前『延迟时长』重新登记（覆盖原任务）",
@@ -2598,6 +2602,573 @@ def set_notify_enabled(aumid, on, root_sub=None):
 
 
 # --------------------------------------------------------------------------
+# 浏览器劫持检测：系统代理 / 浏览器策略 / IE 主页 / hosts / 被追加网址的浏览器快捷方式
+#
+# 这几处是国产流氓软件和钓鱼劫持最常下手的地方，普通「启动项管理器」一个都不看。
+# 分三层：采集（只读）→ 分析（纯函数，喂数据就能测）→ 处理（统一走带备份的 reg_edit /
+# hosts_clean / lnk_args，都能还原）。
+# 公司 / 学校 / MDM 管理的电脑上，策略和代理本来就是管理员配的：这类只提示、不建议处理。
+# --------------------------------------------------------------------------
+_INET = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+HOSTS_PATH = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                          "System32", "drivers", "etc", "hosts")
+_TCPIP = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+
+# 「导航站」：被捆绑软件写进浏览器主页的常客。用户自己设的也可能是它们，所以只提示、由用户定夺
+_NAV_HOSTS = ("hao123.com", "2345.com", "114la.com", "hao.360.cn", "hao.qq.com", "265.com",
+              "123.sogou.com", "5566.net", "hao.uc.cn", "daohang.sogou.com", "site.baidu.com")
+_SECURITY_DOMAINS = (
+    "windowsupdate.com", "update.microsoft.com", "wustat.windows.com", "ntservicepack.microsoft.com",
+    "kaspersky.com", "kaspersky-labs.com", "avast.com", "avg.com", "eset.com", "malwarebytes.com",
+    "bitdefender.com", "symantec.com", "norton.com", "mcafee.com", "sophos.com", "trendmicro.com",
+    "f-secure.com", "360.cn", "360safe.com", "qihoo.com", "huorong.cn", "duba.net", "ijinshan.com",
+    "guanjia.qq.com")
+_BANK_DOMAINS = (
+    "icbc.com.cn", "ccb.com", "boc.cn", "abchina.com", "cmbchina.com", "bankcomm.com",
+    "spdb.com.cn", "cib.com.cn", "pingan.com", "psbc.com", "unionpay.com", "95516.com",
+    "citicbank.com", "cebbank.com", "cmbc.com.cn", "alipay.com", "paypal.com")
+_POPULAR_DOMAINS = (
+    "baidu.com", "taobao.com", "tmall.com", "qq.com", "weixin.qq.com", "jd.com", "sina.com.cn",
+    "weibo.com", "163.com", "126.com", "sogou.com", "bilibili.com", "douyin.com", "microsoft.com",
+    "bing.com", "apple.com")
+_BROWSER_EXES = {
+    "chrome.exe", "msedge.exe", "firefox.exe", "iexplore.exe", "brave.exe", "opera.exe",
+    "vivaldi.exe", "360se.exe", "360chrome.exe", "360chromex.exe", "qqbrowser.exe",
+    "sogouexplorer.exe", "2345explorer.exe", "liebao.exe", "maxthon.exe", "ucbrowser.exe",
+    "baidubrowser.exe", "theworld.exe", "chromium.exe", "browser.exe", "waterfox.exe",
+    "librewolf.exe", "chrome_proxy.exe", "msedge_proxy.exe", "pwahelper.exe", "launcher.exe"}
+_BROWSER_NAME_RE = re.compile(
+    r"chrome|edge|firefox|brave|opera|vivaldi|internet explorer|火狐|谷歌|浏览器|browser|"
+    r"360|qq浏览|搜狗|2345|猎豹|傲游|maxthon|^ie$", re.I)
+_SCRIPT_HOSTS = {"cmd.exe", "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe",
+                 "mshta.exe", "rundll32.exe", "regsvr32.exe", "bitsadmin.exe", "curl.exe"}
+_URL_RE = re.compile(r"(?:https?://|ftp://|www\.)[^\s\"']+", re.I)
+
+
+def _host_of(url):
+    try:
+        import urllib.parse
+        u = (url or "").strip().strip('"')
+        return (urllib.parse.urlparse(u if "://" in u else "http://" + u).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _dom_match(host, domains):
+    h = (host or "").lower().strip(".")
+    return any(h == d or h.endswith("." + d) for d in domains)
+
+
+def is_nav_host(host):
+    return _dom_match(host, _NAV_HOSTS)
+
+
+def is_managed_machine():
+    """域成员 / MDM 注册的电脑：策略和代理多半是管理员配的，不当劫持报。"""
+    try:
+        dom = _reg_str(HKLM, _TCPIP, "Domain").strip()
+        if dom:
+            return True
+    except Exception:
+        pass
+    try:
+        with winreg.OpenKey(HKLM, r"SOFTWARE\Microsoft\Enrollments", 0, winreg.KEY_READ) as k:
+            for i in range(winreg.QueryInfoKey(k)[0]):
+                sub = winreg.EnumKey(k, i)
+                if _reg_str(HKLM, r"SOFTWARE\Microsoft\Enrollments" + "\\" + sub, "ProviderID").strip():
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def tcp_listeners():
+    """本机 IPv4 在监听的 TCP 端口：{(ip, port): pid}。"""
+    import socket
+    import struct
+    iph = ctypes.WinDLL("iphlpapi")
+    iph.GetExtendedTcpTable.restype = ctypes.c_ulong
+    iph.GetExtendedTcpTable.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong),
+                                        ctypes.c_int, ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    size = ctypes.c_ulong(0)
+    iph.GetExtendedTcpTable(None, ctypes.byref(size), False, 2, 3, 0)   # AF_INET, LISTENER
+    buf = None
+    for _ in range(6):
+        buf = ctypes.create_string_buffer(size.value + 4096)
+        rc = iph.GetExtendedTcpTable(buf, ctypes.byref(size), False, 2, 3, 0)
+        if rc == 0:
+            break
+        if rc != 122:                                                   # ERROR_INSUFFICIENT_BUFFER
+            raise OSError(rc, "GetExtendedTcpTable failed")
+    n = struct.unpack_from("<I", buf, 0)[0]
+    out = {}
+    for i in range(n):
+        _st, la, lp, _ra, _rp, pid = struct.unpack_from("<6I", buf, 4 + i * 24)
+        port = ((lp & 0xFF) << 8) | ((lp >> 8) & 0xFF)
+        out[(socket.inet_ntoa(struct.pack("<I", la)), port)] = pid
+    return out
+
+
+def parse_proxy_server(text):
+    """ProxyServer 值 → [(协议, 主机, 端口)]。支持 host:port 和 http=h:p;https=h:p;socks=h:p。"""
+    out = []
+    for part in re.split(r"[;\s]+", (text or "").strip()):
+        if not part:
+            continue
+        scheme = ""
+        if "=" in part and "://" not in part:
+            scheme, part = part.split("=", 1)
+        part = re.sub(r"^[a-z]+://", "", part, flags=re.I).rstrip("/")
+        m = re.match(r"^(\[[^\]]+\]|[^:]+):(\d{1,5})$", part)
+        if m:
+            out.append((scheme.lower(), m.group(1).strip("[]"), int(m.group(2))))
+        elif part:
+            out.append((scheme.lower(), part, 80))
+    return out
+
+
+def _is_loopback_host(h):
+    h = (h or "").lower()
+    return h == "localhost" or h.startswith("127.") or h in ("::1", "0.0.0.0")
+
+
+def read_proxy_state():
+    base = _INET
+    return {
+        "enable": _reg_dword(HKCU, base, "ProxyEnable") or 0,
+        "server": _reg_str(HKCU, base, "ProxyServer"),
+        "pac": _reg_str(HKCU, base, "AutoConfigURL"),
+        "autodetect": _reg_dword(HKCU, base, "AutoDetect"),
+    }
+
+
+# 浏览器策略里「会把用户带去别处 / 装扩展」的值。HomepageIsNewTabPage 之类的开关本身无害，不算
+_POLICY_BROWSERS = (
+    ("Chrome", r"SOFTWARE\Policies\Google\Chrome"),
+    ("Edge", r"SOFTWARE\Policies\Microsoft\Edge"),
+    ("Brave", r"SOFTWARE\Policies\BraveSoftware\Brave"),
+)
+_POLICY_VALUES = ("HomepageLocation", "NewTabPageLocation", "DefaultSearchProviderSearchURL",
+                  "DefaultSearchProviderNewTabURL", "ProxyPacUrl", "ProxyServer")
+_POLICY_SUBKEYS = ("RestoreOnStartupURLs", "ExtensionInstallForcelist")
+
+
+def read_browser_policies():
+    """机器上设了哪些会改主页 / 搜索 / 代理 / 强装扩展的浏览器策略：[{browser, hive, subkey, name, value}]。"""
+    out = []
+    for browser, key in _POLICY_BROWSERS:
+        for hive in ("HKLM", "HKCU"):
+            root = _root_of(hive)
+            for name, val in _policy_value_pairs(root, key):
+                if name in _POLICY_VALUES and str(val).strip():
+                    out.append({"browser": browser, "hive": hive, "subkey": key,
+                                "name": name, "value": str(val)})
+            for sub in _POLICY_SUBKEYS:
+                for name, val in _policy_value_pairs(root, key + "\\" + sub):
+                    if str(val).strip():
+                        out.append({"browser": browser, "hive": hive, "subkey": key + "\\" + sub,
+                                    "name": name, "value": str(val)})
+    for hive in ("HKLM", "HKCU"):                           # Firefox：Homepage 子键
+        key = r"SOFTWARE\Policies\Mozilla\Firefox\Homepage"
+        for name, val in _policy_value_pairs(_root_of(hive), key):
+            if name in ("URL", "StartPage", "Additional") and str(val).strip():
+                out.append({"browser": "Firefox", "hive": hive, "subkey": key,
+                            "name": name, "value": str(val)})
+    return out
+
+
+def _policy_value_pairs(root, sub):
+    """某个键下所有值：[(名称, 数据)]。键不存在返回空。"""
+    out = []
+    try:
+        with winreg.OpenKey(root, sub, 0, winreg.KEY_READ) as k:
+            i = 0
+            while True:
+                try:
+                    name, val, _t = winreg.EnumValue(k, i)
+                except OSError:
+                    break
+                out.append((name, val))
+                i += 1
+    except OSError:
+        pass
+    return out
+
+
+def read_ie_pages():
+    """IE 主页 / 搜索页。IE 早已退役，但内嵌 IE 控件的老软件还在读这些值，导航站也还在写。"""
+    main = r"Software\Microsoft\Internet Explorer\Main"
+    return [{"name": n, "value": _reg_str(HKCU, main, n)}
+            for n in ("Start Page", "Default_Page_URL", "Search Page") if _reg_str(HKCU, main, n)]
+
+
+def read_hosts(path=None):
+    p = path or HOSTS_PATH
+    d = {"path": p, "text": "", "readonly": False, "exists": os.path.isfile(p),
+         "database_path": os.path.expandvars(_reg_str(HKLM, _TCPIP, "DataBasePath") or "")}
+    if d["exists"]:
+        try:
+            with open(p, "rb") as fp:
+                d["text"] = _decode_hosts(fp.read(1 << 20))[0]
+        except OSError as e:
+            log_line("read hosts failed: %r" % (e,))
+    return d
+
+
+def _decode_hosts(raw):
+    """hosts 的编码不固定：UTF-8（可带 BOM）、UTF-16，中文系统上也常见 GBK。返回 (文本, 编码)。"""
+    if raw[:3] == b"\xef\xbb\xbf":
+        return raw[3:].decode("utf-8", "replace"), "utf-8-sig"
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16", "replace"), "utf-16"
+    try:
+        return raw.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        enc = _ANSI if os.name == "nt" else "gbk"
+        return raw.decode(enc, "replace"), enc
+
+
+def norm_hosts_line(line):
+    return re.sub(r"\s+", " ", (line or "").split("#", 1)[0]).strip().lower()
+
+
+def _benign_hosts_name(n):
+    n = n.lower()
+    return (n in ("localhost", "localhost.localdomain", "broadcasthost", "ip6-localhost",
+                  "ip6-loopback", "local", "host.docker.internal", "gateway.docker.internal",
+                  "kubernetes.docker.internal")
+            or n.endswith((".docker.internal", ".internal", ".local", ".localhost", ".lan", ".home",
+                           ".wsl", ".test", ".localdomain")))
+
+
+def analyze_hosts(text):
+    """逐行判断 hosts：返回 [{line, norm, ip, names, verdict, why}]，只含有问题 / 值得提的行。
+
+    verdict：
+      block_security   把杀软 / 系统更新的域名指向本机（让它们连不上，恶意软件常用）  高危
+      redirect_bank    把银行 / 支付的域名指向外部 IP（典型钓鱼）                      高危
+      redirect_popular 把常用网站指向外部 IP                                          中危
+      redirect_other   把别的域名指向外部公网 IP（可能是自己配的，比如加速 GitHub）    提示
+    """
+    import ipaddress
+    out = []
+    for raw in (text or "").splitlines():
+        norm = norm_hosts_line(raw)
+        if not norm:
+            continue
+        parts = norm.split(" ")
+        if len(parts) < 2:
+            continue
+        try:
+            ip = ipaddress.ip_address(parts[0].split("%")[0])
+        except ValueError:
+            continue
+        names = [n for n in parts[1:] if n]
+        names = [n for n in names if not _benign_hosts_name(n)]
+        if not names:
+            continue
+        local = ip.is_loopback or ip.is_unspecified
+        ext = bool(ip.is_global)                      # 公网地址；私网 / 文档保留段 / 链路本地都不算
+        v = why = ""
+        sec = [n for n in names if _dom_match(n, _SECURITY_DOMAINS)]
+        bank = [n for n in names if _dom_match(n, _BANK_DOMAINS)]
+        pop = [n for n in names if _dom_match(n, _POPULAR_DOMAINS)]
+        if sec and (local or ext):
+            v, why = "block_security", "把安全软件 / 系统更新的域名（%s）指向了 %s，它们会连不上" % (sec[0], parts[0])
+        elif bank and ext:
+            v, why = "redirect_bank", "把银行 / 支付网站（%s）指向了外部地址 %s，典型的钓鱼劫持" % (bank[0], parts[0])
+        elif pop and ext:
+            v, why = "redirect_popular", "把常用网站（%s）指向了外部地址 %s" % (pop[0], parts[0])
+        elif ext:
+            v, why = "redirect_other", "%s → %s" % (names[0], parts[0])
+        if v:
+            out.append({"line": raw.strip(), "norm": norm, "ip": parts[0], "names": names,
+                        "verdict": v, "why": why})
+    return out
+
+
+def _desktop_dirs():
+    dirs = []
+    for root in (os.environ.get("USERPROFILE"), os.environ.get("PUBLIC"), os.environ.get("OneDrive")):
+        if root:
+            dirs.append(os.path.join(root, "Desktop"))
+    return dirs
+
+
+def _lnk_roots():
+    appdata, pdata = os.environ.get("APPDATA", ""), os.environ.get("ProgramData", "")
+    roots = [(d, 1) for d in _desktop_dirs()]
+    roots += [(os.path.join(appdata, r"Microsoft\Windows\Start Menu\Programs"), 3),
+              (os.path.join(pdata, r"Microsoft\Windows\Start Menu\Programs"), 3),
+              (os.path.join(appdata, r"Microsoft\Internet Explorer\Quick Launch"), 3)]
+    return [(d, n) for d, n in roots if d and os.path.isdir(d)]
+
+
+def scan_browser_shortcuts(roots=None, cap=1500):
+    """桌面 / 开始菜单 / 任务栏上和浏览器有关的快捷方式：[{path, name, target, args}]。
+
+    「有关」= 名字像浏览器，或目标是已知浏览器程序。全部原生解析，不起 PowerShell。
+    启动文件夹（Startup）不看：那是自启项，由启动项扫描负责。
+    """
+    out, seen, n_files = [], set(), 0
+    for root, depth in (roots if roots is not None else _lnk_roots()):
+        base = root.rstrip("\\/").count(os.sep)
+        for dp, dirs, files in os.walk(root):
+            if dp.count(os.sep) - base >= depth:
+                dirs[:] = []
+            dirs[:] = [d for d in dirs if d.lower() != "startup"]
+            for fn in files:
+                if not fn.lower().endswith(".lnk"):
+                    continue
+                n_files += 1
+                if n_files > cap:
+                    return out
+                p = os.path.join(dp, fn)
+                if p.lower() in seen:
+                    continue
+                seen.add(p.lower())
+                name = os.path.splitext(fn)[0]
+                info = parse_lnk(p)
+                if not info:
+                    continue
+                tgt = info.get("target") or ""
+                exe = ntpath.basename(tgt).lower()
+                if _BROWSER_NAME_RE.search(name) or exe in _BROWSER_EXES:
+                    out.append({"path": p, "name": name, "target": tgt,
+                                "args": info.get("args") or ""})
+    return out
+
+
+def strip_urls_from_args(args):
+    """去掉参数里被追加的网址，保留 --app= / --profile-directory= 这类正常参数。"""
+    def keep(m):
+        pre = (args or "")[max(0, m.start() - 12):m.start()].lower()
+        return m.group(0) if re.search(r"--(app|app-id|profile-directory)=\"?$", pre) else ""
+    return re.sub(r"\s+", " ", _URL_RE.sub(keep, args or "")).strip()
+
+
+def analyze_shortcut(e):
+    """判断一个浏览器快捷方式有没有被动手脚。返回 {verdict, sev, why, new_args} 或 None。"""
+    name, tgt, args = e.get("name") or "", e.get("target") or "", e.get("args") or ""
+    exe = ntpath.basename(tgt).lower()
+    browserish = bool(_BROWSER_NAME_RE.search(name))
+    urls = [m.group(0) for m in _URL_RE.finditer(args)]
+    plain = [u for u in urls if strip_urls_from_args(args).find(u) < 0]   # 不是 --app= 里的
+    if browserish and exe in _SCRIPT_HOSTS:
+        return {"verdict": "script_host", "sev": "high",
+                "why": "名字是浏览器，实际运行的却是 %s（脚本 / 命令解释器）：%s %s" % (exe, tgt, args),
+                "new_args": None}
+    if plain and exe in _BROWSER_EXES:
+        navs = [u for u in plain if is_nav_host(_host_of(u))]
+        if navs:
+            return {"verdict": "nav_url", "sev": "high",
+                    "why": "启动浏览器时会自动打开导航站 %s" % navs[0], "new_args": strip_urls_from_args(args)}
+        if browserish:
+            return {"verdict": "extra_url", "sev": "mid",
+                    "why": "这是浏览器本身的快捷方式，却带了网址参数 %s（每次点开都会先跳到那里）" % plain[0],
+                    "new_args": strip_urls_from_args(args)}
+    if (browserish and tgt and exe not in _BROWSER_EXES and exe not in _SCRIPT_HOSTS
+            and re.search(r"(?i)chrome|edge|firefox|brave|opera|vivaldi|火狐|谷歌", name)):
+        low = tgt.lower()
+        if not low.startswith(tuple(x.lower() for x in (
+                os.environ.get("ProgramFiles", r"C:\Program Files"),
+                os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                os.environ.get("SystemRoot", r"C:\Windows"),
+                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")) if x)):
+            return {"verdict": "wrong_target", "sev": "mid",
+                    "why": "名字是 %s，实际指向 %s，不是浏览器程序" % (name, tgt), "new_args": None}
+    return None
+
+
+def collect_hijack():
+    """采集浏览器劫持相关的现状（只读，各项独立兜底，任何一项失败都不影响别的）。"""
+    d = {"managed": False, "proxy": {}, "listeners": [], "policies": [], "ie": [],
+         "hosts": {}, "lnks": []}
+
+    def safe(key, fn, default):
+        try:
+            d[key] = fn()
+        except Exception as e:
+            log_line("collect_hijack %s failed: %r" % (key, e))
+            d[key] = default
+
+    safe("managed", is_managed_machine, False)
+    safe("proxy", read_proxy_state, {})
+    px = d["proxy"] or {}
+    if px.get("enable") and any(_is_loopback_host(h) for _s, h, _p in parse_proxy_server(px.get("server"))):
+        def _ls():
+            return [[ip, port, pid] for (ip, port), pid in tcp_listeners().items()]
+        safe("listeners", _ls, [])
+    safe("policies", read_browser_policies, [])
+    safe("ie", read_ie_pages, [])
+    safe("hosts", read_hosts, {})
+    safe("lnks", scan_browser_shortcuts, [])
+    return d
+
+
+def _proxy_findings(d, add):
+    px = d.get("proxy") or {}
+    managed = bool(d.get("managed"))
+    servers = parse_proxy_server(px.get("server"))
+    if px.get("enable") and servers:
+        listen = {(ip, port): pid for ip, port, pid in d.get("listeners") or []}
+        show = "; ".join("%s:%d" % (h, p) for _s, h, p in servers[:3])
+        fix = {"type": "reg_edit", "risk": "confirm", "items": [
+            {"hive": "HKCU", "subkey": _INET, "name": "ProxyEnable", "action": "set",
+             "type": winreg.REG_DWORD, "value": 0}]}
+        loop = [(h, p) for _s, h, p in servers if _is_loopback_host(h)]
+        if loop and len(loop) == len(servers):
+            dead = [(h, p) for h, p in loop if not any(
+                port == p and ip in ("0.0.0.0", h, "127.0.0.1") for (ip, port) in listen)]
+            if dead:
+                add(id="hij_proxy_dead", cat="浏览器劫持", sev="mid",
+                    title="系统代理指向本机 %s，但没有任何程序在监听" % show,
+                    short="代理软件退出 / 卸载后没清掉，会导致上不了网",
+                    detail=("系统代理已开启，指向 %s；可这个端口上没有程序在监听。\n\n"
+                            "最常见的原因：Clash / V2Ray / 某加速器退出或卸载时没有把系统代理关掉，"
+                            "结果浏览器和很多软件都连不上网。\n\n"
+                            "处理：关闭系统代理（只把「使用代理服务器」开关改成关，代理地址保留，"
+                            "之后想用还能一键再开）。") % show,
+                    fix=fix, default=False)
+            else:
+                pid = next((pid for (ip, port), pid in listen.items() if port == loop[0][1]), 0)
+                who = os.path.basename(_proc_image_path(pid)) if pid else ""
+                add(id="hij_proxy_local", cat="浏览器劫持", sev="info",
+                    title="系统代理已开启：%s%s" % (show, ("（%s 在监听）" % who) if who else ""),
+                    short="指向本机，常见于代理软件", detail="系统代理指向本机且有程序在监听，一般是你自己的代理软件。")
+        else:
+            add(id="hij_proxy_remote", cat="浏览器劫持", sev="info" if managed else "mid",
+                title="系统代理指向外部地址：%s" % show,
+                short="单位网络管理的" if managed else "你的网页流量会经过它",
+                detail=("系统代理指向 %s：浏览器和不少软件的 HTTP(S) 流量都会先发给它。\n\n"
+                        "· 公司 / 学校网络常见，由管理员配置；\n"
+                        "· 如果你自己没设过，要警惕——代理方能看到并改动你访问的网页。") % show,
+                fix=None if managed else fix, default=False)
+    if px.get("pac"):
+        add(id="hij_pac", cat="浏览器劫持", sev="info" if managed else "mid",
+            title="系统配置了自动代理脚本（PAC）：%s" % px["pac"][:80],
+            short="单位网络管理的" if managed else "网络流量由这个脚本决定走向",
+            detail=("自动配置脚本地址：%s\n\nPAC 脚本能决定每个网址是否走代理、走哪个代理。"
+                    "公司网络常见；自己没设过的话，可能是软件悄悄加的。") % px["pac"],
+            fix=None if managed else {"type": "reg_edit", "risk": "confirm", "items": [
+                {"hive": "HKCU", "subkey": _INET, "name": "AutoConfigURL", "action": "delete"}]},
+            default=False)
+
+
+def _policy_findings(d, add):
+    pols = d.get("policies") or []
+    if not pols:
+        return
+    managed = bool(d.get("managed"))
+    by = {}
+    for p in pols:
+        by.setdefault(p["browser"], []).append(p)
+    for browser, rows in by.items():
+        navs = [r for r in rows if is_nav_host(_host_of(r["value"]))]
+        sev = "info" if managed else ("high" if navs else "mid")
+        lines = ["· %s\\%s\\%s = %s" % (r["hive"], r["subkey"], r["name"], r["value"][:100])
+                 for r in rows[:12]]
+        add(id="hij_policy@" + browser, cat="浏览器劫持", sev=sev,
+            title="%s 被「组织策略」锁定了 %d 项设置" % (browser, len(rows)),
+            short="单位管理的电脑属正常" if managed else "主页 / 搜索 / 扩展被强制指定",
+            detail=("注册表里有 %s 的策略值，浏览器会显示「由你的组织管理」，这些设置在浏览器里改不回来：\n\n%s\n\n"
+                    "%s") % (browser, "\n".join(lines),
+                            "这台电脑是域 / MDM 管理的，策略多半是管理员配的，不建议动。" if managed else
+                            "这台电脑不是单位管理的，却有这些策略——常见于主页劫持软件，或被强装扩展。"
+                            "确认不是自己设的话可以清掉（原值已备份，可还原）。"),
+            fix=None if managed else {"type": "reg_edit", "risk": "confirm", "items": [
+                {"hive": r["hive"], "subkey": r["subkey"], "name": r["name"], "action": "delete"}
+                for r in rows]},
+            default=False)
+
+
+def _ie_findings(d, add):
+    bad = [r for r in d.get("ie") or [] if is_nav_host(_host_of(r["value"]))]
+    if not bad:
+        return
+    main = r"Software\Microsoft\Internet Explorer\Main"
+    add(id="hij_ie_start", cat="浏览器劫持", sev="mid",
+        title="IE 主页 / 搜索页被设成了导航站：%s" % _host_of(bad[0]["value"]),
+        short="内嵌 IE 控件的老软件会打开它",
+        detail=("\n".join("· %s = %s" % (r["name"], r["value"]) for r in bad) +
+                "\n\n导航站是捆绑软件最爱写的主页。如果是你自己设的，可以忽略这一项。"),
+        fix={"type": "reg_edit", "risk": "confirm", "items": [
+            {"hive": "HKCU", "subkey": main, "name": r["name"], "action": "set",
+             "type": winreg.REG_SZ, "value": "about:blank"} for r in bad]},
+        default=False)
+
+
+def _hosts_findings(d, add):
+    h = d.get("hosts") or {}
+    dbp = (h.get("database_path") or "").rstrip("\\/").lower()
+    std = os.path.dirname(HOSTS_PATH).rstrip("\\/").lower()
+    if dbp and dbp != std:
+        add(id="hij_hosts_path", cat="浏览器劫持", sev="high",
+            title="hosts 文件的位置被改到了别处：%s" % h.get("database_path"),
+            short="系统读的不是真正的 hosts",
+            detail=("注册表 Tcpip\\\\Parameters\\\\DataBasePath 默认指向 %s，现在是 %s。\n\n"
+                    "这是一种躲避检查的手法：你看到的 hosts 是干净的，系统实际读的却是另一份。\n"
+                    "处理：把它改回默认值（原值已备份，可还原）。") % (os.path.dirname(HOSTS_PATH), h.get("database_path")),
+            fix={"type": "reg_edit", "risk": "confirm", "items": [
+                {"hive": "HKLM", "subkey": _TCPIP, "name": "DataBasePath", "action": "set",
+                 "type": winreg.REG_EXPAND_SZ, "value": r"%SystemRoot%\System32\drivers\etc"}]},
+            default=False)
+    rows = analyze_hosts(h.get("text") or "")
+    for verdict, sev, fid, title in (
+            ("block_security", "high", "hij_hosts_block", "hosts 屏蔽了安全软件 / 系统更新的域名"),
+            ("redirect_bank", "high", "hij_hosts_bank", "hosts 把银行 / 支付网站指向了外部地址"),
+            ("redirect_popular", "mid", "hij_hosts_popular", "hosts 把常用网站指向了外部地址")):
+        sel = [r for r in rows if r["verdict"] == verdict]
+        if not sel:
+            continue
+        add(id=fid, cat="浏览器劫持", sev=sev, title="%s（%d 行）" % (title, len(sel)),
+            short="hosts 劫持" if verdict != "block_security" else "让杀软 / 更新连不上",
+            detail=("hosts 文件（%s）里有这些行：\n\n%s\n\n"
+                    "hosts 优先于 DNS，写在这里的域名会被直接指到对应地址。\n"
+                    "是你自己配的（比如开发测试）就忽略；不认识的话建议删除。"
+                    "删除前会备份整个文件，可还原。") % (
+                h.get("path") or HOSTS_PATH, "\n".join("· %s    %s" % (r["line"], r["why"]) for r in sel[:15])),
+            fix={"type": "hosts_clean", "risk": "confirm",
+                 "items": [{"path": h.get("path") or HOSTS_PATH, "lines": [r["norm"] for r in sel]}]},
+            default=False)
+    other = [r for r in rows if r["verdict"] == "redirect_other"]
+    if other:
+        add(id="hij_hosts_other", cat="浏览器劫持", sev="info",
+            title="hosts 里有 %d 行把域名指向外部公网地址" % len(other),
+            short="多半是自己配的（如加速 GitHub）",
+            detail="\n".join("· %s" % r["line"] for r in other[:20]) +
+                   "\n\n不认识的话再处理；这类很常见，比如用来加速 GitHub。")
+
+
+def _lnk_findings(d, add):
+    for e in d.get("lnks") or []:
+        r = analyze_shortcut(e)
+        if not r:
+            continue
+        fix = None
+        if r.get("new_args") is not None and r["new_args"] != (e.get("args") or ""):
+            fix = {"type": "lnk_args", "risk": "confirm", "items": [
+                {"path": e["path"], "args": e.get("args") or "", "new_args": r["new_args"]}]}
+        add(id="hij_lnk@" + e["path"].lower(), cat="浏览器劫持", sev=r["sev"],
+            title="浏览器快捷方式被动过手脚：%s" % e["name"], short=r["why"][:60],
+            detail=("快捷方式：%s\n目标：%s\n参数：%s\n\n%s\n\n%s") % (
+                e["path"], e.get("target") or "", e.get("args") or "（无）", r["why"],
+                "处理：把多出来的网址从参数里去掉，其余不变（原快捷方式已备份，可还原）。" if fix else
+                "这一项没法自动处理，建议删掉这个快捷方式，重新从浏览器安装目录发送一个。"),
+            fix=fix, default=False)
+
+
+def _hijack_findings(d, add):
+    if not d:
+        return
+    for fn in (_proxy_findings, _policy_findings, _ie_findings, _hosts_findings, _lnk_findings):
+        try:
+            fn(d, add)
+        except Exception as e:
+            log_line("hijack finding %s failed: %r" % (fn.__name__, e))
+
+
+# --------------------------------------------------------------------------
 # 采集 2：服务（注册表直读，含镜像文件存在性）
 # --------------------------------------------------------------------------
 
@@ -3087,6 +3658,8 @@ def collect(progress=None, should_stop=None):
     except Exception as e:
         log_line("extra autostarts failed: %r" % (e,))
         raw["extra"] = []
+    P("检查浏览器劫持（代理 / 策略 / hosts / 快捷方式）…")
+    raw["hijack"] = collect_hijack()
     P("比对流氓软件 / 全家桶特征库 …")
     try:
         raw["adware"] = adware_scan(raw)
@@ -3400,11 +3973,105 @@ def _file_version_info(path):
 _LNK_CACHE = {}
 
 
-def resolve_shortcuts_bulk(lnks):
-    """一次 PowerShell 批量解析快捷方式。
+_ANSI = "mbcs" if os.name == "nt" else "latin-1"
 
-    逐条解析要 250ms/条（每次起一个 powershell 进程），6 个启动快捷方式就是 1.5 秒，
-    体检里最大的冤枉开销之一。这里把待解析清单塞进环境变量，一次进程全解掉。
+
+def _lnk_linkinfo_target(li):
+    """LinkInfo 结构里的本地目标路径（LocalBasePath + CommonPathSuffix）；网络路径等返回 ""。"""
+    import struct
+    if len(li) < 28:
+        return ""
+    hsize, lflags = struct.unpack_from("<2I", li, 4)
+    base_off, suf_off = struct.unpack_from("<2I", li, 16)[0], struct.unpack_from("<I", li, 24)[0]
+    if not (lflags & 1):                                   # 没有 VolumeID + LocalBasePath
+        return ""
+    base_u = suf_u = 0
+    if hsize >= 0x24 and len(li) >= 36:
+        base_u, suf_u = struct.unpack_from("<2I", li, 28)
+
+    def cstr(off, uni):
+        if not off or off >= len(li):
+            return ""
+        if uni:
+            end = off
+            while end + 1 < len(li) and li[end:end + 2] != b"\x00\x00":
+                end += 2
+            return li[off:end].decode("utf-16-le", "replace")
+        end = li.find(b"\x00", off)
+        return li[off:len(li) if end < 0 else end].decode(_ANSI, "replace")
+
+    base = cstr(base_u, True) if base_u else cstr(base_off, False)
+    suf = cstr(suf_u, True) if suf_u else cstr(suf_off, False)
+    return (base + suf) if base else ""
+
+
+def parse_lnk_bytes(b):
+    """按 MS-SHLLINK 解析 .lnk：返回 {target, args, workdir, icon, name, relpath}，格式不对返回 None。
+
+    只取「指向哪个文件、带什么参数」。目标只存在于 IDList（没有 LinkInfo / 环境变量块）的快捷方式
+    解析不出来，返回的 target 是 ""，调用方退回 COM 解析。
+    """
+    import struct
+    if len(b) < 76 or struct.unpack_from("<I", b, 0)[0] != 0x4C:
+        return None
+    flags = struct.unpack_from("<I", b, 20)[0]
+    uni = bool(flags & 0x80)
+    pos = 76
+    if flags & 0x01:                                       # HasLinkTargetIDList
+        if pos + 2 > len(b):
+            return None
+        pos += 2 + struct.unpack_from("<H", b, pos)[0]
+    target = ""
+    if flags & 0x02:                                       # HasLinkInfo
+        if pos + 4 > len(b):
+            return None
+        size = struct.unpack_from("<I", b, pos)[0]
+        if size < 28 or pos + size > len(b):
+            return None
+        target = _lnk_linkinfo_target(b[pos:pos + size])
+        pos += size
+    out = {"name": "", "relpath": "", "workdir": "", "args": "", "icon": ""}
+    for bit, key in ((0x04, "name"), (0x08, "relpath"), (0x10, "workdir"),
+                     (0x20, "args"), (0x40, "icon")):
+        if not flags & bit:
+            continue
+        if pos + 2 > len(b):
+            return None
+        cnt = struct.unpack_from("<H", b, pos)[0]
+        pos += 2
+        n = cnt * 2 if uni else cnt
+        raw = b[pos:pos + n]
+        pos += n
+        out[key] = raw.decode("utf-16-le", "replace") if uni else raw.decode(_ANSI, "replace")
+    env_target = ""
+    while pos + 8 <= len(b):                               # ExtraData 块
+        size, sig = struct.unpack_from("<2I", b, pos)
+        if size < 8:
+            break
+        if sig == 0xA0000001 and size >= 0x314:            # EnvironmentVariableDataBlock
+            blk = b[pos + 8:pos + size]
+            uni_t = blk[260:780].decode("utf-16-le", "ignore").split("\x00")[0]
+            env_target = uni_t or blk[:260].split(b"\x00")[0].decode(_ANSI, "replace")
+        pos += size
+    out["target"] = target or os.path.expandvars(env_target)
+    return out
+
+
+def parse_lnk(path):
+    import struct
+    try:
+        with open(path, "rb") as fp:
+            return parse_lnk_bytes(fp.read(1 << 20))
+    except (OSError, struct.error):
+        return None
+
+
+def resolve_shortcuts_bulk(lnks):
+    """批量解析快捷方式：先用原生解析，只有解析不出目标的才起一次 PowerShell。
+
+    逐条起 PowerShell 要 250ms/条，6 个启动快捷方式就是 1.5 秒，体检里最大的冤枉开销之一。
+    绝大多数 .lnk 都带 LinkInfo，原生解析一条不到 1ms；剩下的（只有 IDList 的 UWP / 特殊项）
+    塞进环境变量一次进程全解掉。
     """
     todo, seen = [], set()
     for p in lnks or []:
@@ -3417,6 +4084,18 @@ def resolve_shortcuts_bulk(lnks):
         todo.append(p)
     if not todo:
         return 0
+    got = 0
+    rest = []
+    for p in todo:
+        info = parse_lnk(p)
+        if info and info.get("target"):
+            _LNK_CACHE[p] = (info["target"], info.get("args", ""))
+            got += 1
+        else:
+            rest.append(p)
+    if not rest:
+        return got
+    todo = rest
     env = dict(os.environ)
     env["BD_LNKS"] = "\n".join(todo)
     ps = ("$sh=New-Object -ComObject WScript.Shell;"
@@ -3426,7 +4105,6 @@ def resolve_shortcuts_bulk(lnks):
           " Write-Output ($p+[char]9+$s.TargetPath+[char]9+$s.Arguments)}"
           " catch{Write-Output ($p+[char]9+[char]9)}}")
     out = run_ps(ps, timeout=max(30, 5 * len(todo)), env=env) or ""
-    got = 0
     for line in out.splitlines():
         parts = line.split("\t")
         if len(parts) < 2:
@@ -5078,6 +5756,9 @@ def analyze(raw):
             short="多数为系统自带",
             detail="前 40 个：\n" + "\n".join("· %s" % t for t in tasks[:40]))
 
+    # ---------------- 浏览器劫持 ----------------
+    _hijack_findings(raw.get("hijack"), add)
+
     add(id="bios_tip", cat="磁盘与其他", sev="info",
         title="BIOS / 固件层优化建议（可选）",
         short="系统内无法自动处理",
@@ -5326,6 +6007,38 @@ def make_backup(findings, backup_root=None, tag=""):
             for it in fx["items"]:
                 snap["items"].append({"id": rid, "kind": "delay_task_block", "task": it["task"],
                                       "old_enabled": bool(it.get("enabled", True))})
+        elif t == "reg_edit":
+            for it in fx["items"]:
+                hv = it.get("hive", "HKCU")
+                val, typ = _read_startup_value(hv, it["subkey"], it["name"])
+                snap["items"].append({"id": rid, "kind": "reg_edit", "hive": hv,
+                                      "subkey": it["subkey"], "name": it["name"],
+                                      "existed": val is not None, "value": val, "valuetype": typ})
+        elif t == "hosts_clean":
+            for it in fx["items"]:
+                rec = {"id": rid, "kind": "hosts", "name": "hosts", "path": it["path"]}
+                try:
+                    sub_dir = os.path.join(bdir, "hosts")
+                    os.makedirs(sub_dir, exist_ok=True)
+                    dst = os.path.join(sub_dir, "hosts")
+                    shutil.copy2(it["path"], dst)
+                    rec["backup_file"] = os.path.relpath(dst, bdir)
+                except OSError as e:
+                    log_line("backup hosts failed: %r" % (e,))
+                snap["items"].append(rec)
+        elif t == "lnk_args":
+            for n_, it in enumerate(fx["items"]):
+                rec = {"id": rid, "kind": "lnk_args", "name": os.path.basename(it["path"]),
+                       "path": it["path"], "old_args": it.get("args", "")}
+                try:
+                    sub_dir = os.path.join(bdir, "lnk")
+                    os.makedirs(sub_dir, exist_ok=True)
+                    dst = os.path.join(sub_dir, "%d_%s" % (n_, os.path.basename(it["path"])))
+                    shutil.copy2(it["path"], dst)
+                    rec["backup_file"] = os.path.relpath(dst, bdir)
+                except OSError as e:
+                    log_line("backup lnk failed: %r" % (e,))
+                snap["items"].append(rec)
         elif t == "delay_task_del":
             for it in fx["items"]:
                 snap["items"].append({"id": rid, "kind": "delay_task_del", "task": it["task"],
@@ -5366,10 +6079,12 @@ def make_backup_readme_text(snap):
         "service": "服务启动类型", "svc_delay": "服务延迟启动",
         "startup": "自启项启用状态", "startup_delay": "自启项启用状态",
         "delay_task_restore": "自启项启用状态", "startup_delete": "被删的 Run 值",
+        "reg_edit": "浏览器 / 网络相关的注册表设置",
     }
     app_only = {
         "rm_svc": "被删除的服务键", "task": "被禁用的计划任务",
         "delay_task_del": "被删除的计划任务",
+        "hosts": "hosts 文件", "lnk_args": "被改过参数的快捷方式",
     }
     reg_has = [v for k, v in reg_only.items() if k in kinds]
     need = [v for k, v in app_only.items() if k in kinds]
@@ -5402,6 +6117,11 @@ def _reg_value_expr(val, typ):
     if isinstance(val, dict) and "__b64__" in val:
         b = base64.b64decode(val["__b64__"])
         return "hex:" + ",".join("%02x" % x for x in b)
+    if isinstance(val, list):                       # REG_MULTI_SZ
+        b = ("\x00".join(str(x) for x in val) + "\x00\x00").encode("utf-16-le")
+        return "hex(7):" + ",".join("%02x" % x for x in b)
+    if isinstance(val, int) and int(typ or 0) == 11:   # REG_QWORD
+        return "hex(b):" + ",".join("%02x" % x for x in int(val).to_bytes(8, "little"))
     if isinstance(val, int):
         return "dword:%08x" % val
     s = str(val)
@@ -5450,12 +6170,132 @@ def _write_restore_reg(snap, path):
             lines.append('"%s"=%s' % (it["name"],
                                       _reg_value_expr(it["value"], it.get("valuetype"))))
             lines.append("")
+    for it in snap["items"]:
+        if it["kind"] != "reg_edit":
+            continue
+        hive = "HKEY_CURRENT_USER" if it.get("hive") == "HKCU" else "HKEY_LOCAL_MACHINE"
+        lines.append("[%s\\%s]" % (hive, it.get("subkey", "")))
+        if it.get("existed"):
+            lines.append('"%s"=%s' % (it["name"], _reg_value_expr(it.get("value"), it.get("valuetype"))))
+        else:
+            lines.append('"%s"=-' % it["name"])                  # 原来没有：导入时把它删掉
+        lines.append("")
     lines.append("; NOTE: fast-startup revert -> run as admin:  powercfg /h off")
     try:
         with open(path, "w", encoding="utf-16", newline="\r\n") as fp:
             fp.write("\n".join(lines))
     except Exception as e:
         log_line("restore.reg write failed: %r" % (e,))
+
+
+def _reg_edit_apply(it, dry_run=False):
+    """reg_edit：删除或设置一个注册表值。返回 (ok, 说明)。"""
+    hive, sub, name = it.get("hive", "HKCU"), it.get("subkey", ""), it.get("name", "")
+    act = it.get("action", "delete")
+    desc = "%s\\%s\\%s" % (hive, sub, name)
+    if dry_run:
+        return True, "[试运行] %s %s" % ("删除" if act == "delete" else "设置", desc)
+    root = _root_of(hive)
+    try:
+        if act == "delete":
+            try:
+                with winreg.OpenKey(root, sub, 0, winreg.KEY_SET_VALUE) as k:
+                    winreg.DeleteValue(k, name)
+            except FileNotFoundError:
+                return True, "本来就不存在：%s" % desc
+            return True, "已删除：%s" % desc
+        with winreg.CreateKeyEx(root, sub, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, name, 0, int(it.get("type", winreg.REG_SZ)), it.get("value"))
+        return True, "已设置：%s = %s" % (desc, it.get("value"))
+    except OSError as e:
+        return False, "修改失败：%s（%s）" % (desc, e)
+
+
+def _reg_edit_restore(it, dry_run=False):
+    """还原 reg_edit：原来有值就写回原值（含类型），原来没有就把值删掉。"""
+    hive, sub, name = it.get("hive", "HKCU"), it.get("subkey", ""), it.get("name", "")
+    desc = "%s\\%s\\%s" % (hive, sub, name)
+    if dry_run:
+        return True, "[试运行] 还原 %s" % desc
+    root = _root_of(hive)
+    try:
+        if it.get("existed"):
+            val = it.get("value")
+            if isinstance(val, dict) and "__b64__" in val:
+                val = base64.b64decode(val["__b64__"])
+            with winreg.CreateKeyEx(root, sub, 0, winreg.KEY_SET_VALUE) as k:
+                winreg.SetValueEx(k, name, 0, int(it.get("valuetype") or winreg.REG_SZ), val)
+            return True, "已还原：%s" % desc
+        try:
+            with winreg.OpenKey(root, sub, 0, winreg.KEY_SET_VALUE) as k:
+                winreg.DeleteValue(k, name)
+        except FileNotFoundError:
+            pass
+        return True, "已还原（原来没有这个值，已删除）：%s" % desc
+    except OSError as e:
+        return False, "还原失败：%s（%s）" % (desc, e)
+
+
+def _write_file_keep_attr(path, data):
+    """写文件；遇到只读属性先临时去掉再写，写完补回（hosts 常被设成只读）。"""
+    FILE_ATTRIBUTE_READONLY = 0x1
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.GetFileAttributesW.restype = ctypes.c_uint32
+    k32.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
+    k32.SetFileAttributesW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+    attr = k32.GetFileAttributesW(path)
+    ro = attr != 0xFFFFFFFF and bool(attr & FILE_ATTRIBUTE_READONLY)
+    if ro:
+        k32.SetFileAttributesW(path, attr & ~FILE_ATTRIBUTE_READONLY)
+    try:
+        with open(path, "wb") as fp:
+            fp.write(data)
+    finally:
+        if ro:
+            k32.SetFileAttributesW(path, attr)
+
+
+def _clean_hosts_file(path, norm_lines, dry_run=False):
+    """从 hosts 里删掉指定的行（按「去注释、压空白、小写」后的内容匹配），保持原编码和换行。"""
+    want = {norm_hosts_line(x) for x in norm_lines or [] if norm_hosts_line(x)}
+    try:
+        with open(path, "rb") as fp:
+            raw = fp.read()
+    except OSError as e:
+        return False, "读取 hosts 失败：%s" % e
+    text, enc = _decode_hosts(raw)
+    keep, removed = [], 0
+    for ln in text.splitlines(keepends=True):
+        if norm_hosts_line(ln) in want:
+            removed += 1
+        else:
+            keep.append(ln)
+    if dry_run:
+        return True, "[试运行] 将从 hosts 删除 %d 行" % removed
+    if not removed:
+        return True, "hosts 里没有要删的行（可能已经清理过）"
+    try:
+        _write_file_keep_attr(path, "".join(keep).encode(enc))
+    except OSError as e:
+        return False, "写入 hosts 失败：%s（需要管理员权限，且杀软可能在保护这个文件）" % e
+    _run(["ipconfig", "/flushdns"], timeout=15)
+    return True, "已从 hosts 删除 %d 行" % removed
+
+
+def _set_lnk_args(path, new_args, dry_run=False):
+    """改快捷方式的参数（WScript.Shell 的 Arguments + Save），改完回读校验。"""
+    if dry_run:
+        return True, "[试运行] 改写快捷方式参数：%s" % path
+    env = dict(os.environ)
+    env["BD_LNK"], env["BD_ARGS"] = path, new_args or ""
+    out = run_ps("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:BD_LNK);"
+                 "$s.Arguments=$env:BD_ARGS;$s.Save();'OK'", timeout=60, env=env)
+    if "OK" not in out:
+        return False, "改写快捷方式失败：%s" % path
+    info = parse_lnk(path) or {}
+    if (info.get("args") or "") != (new_args or ""):
+        return False, "改写后校验不一致：%s（参数现为 %r）" % (path, info.get("args"))
+    return True, "已清掉快捷方式里多余的网址：%s" % path
 
 
 def _set_service_start(name, val, dry_run=False):
@@ -5775,6 +6615,21 @@ def apply_fixes(findings, backup_dir, progress=None, dry_run=False):
                     ok, msg = _set_task_enabled(it["task"], False, dry_run)
                     res["msgs"].append(msg)
                     res["ok"] = res["ok"] and ok
+            elif t == "reg_edit":
+                for it in fx["items"]:
+                    ok, msg = _reg_edit_apply(it, dry_run)
+                    res["msgs"].append(msg)
+                    res["ok"] = res["ok"] and ok
+            elif t == "hosts_clean":
+                for it in fx["items"]:
+                    ok, msg = _clean_hosts_file(it["path"], it.get("lines"), dry_run)
+                    res["msgs"].append(msg)
+                    res["ok"] = res["ok"] and ok
+            elif t == "lnk_args":
+                for it in fx["items"]:
+                    ok, msg = _set_lnk_args(it["path"], it.get("new_args", ""), dry_run)
+                    res["msgs"].append(msg)
+                    res["ok"] = res["ok"] and ok
             elif t == "delay_task_del":
                 for it in fx["items"]:
                     ok, msg = _remove_delay_task(it["task"], dry_run)
@@ -5939,6 +6794,29 @@ def restore_backup(backup_dir, progress=None, dry_run=False):
                                                  delay_sec=int(it.get("old_delay") or 0))
                     res["msgs"].append(m4)
                     res["ok"] = ok4
+            elif k == "reg_edit":
+                ok, msg = _reg_edit_restore(it, dry_run)
+                res["ok"] = ok
+                res["msgs"].append(msg)
+            elif k in ("hosts", "lnk_args"):
+                src = os.path.join(backup_dir, it.get("backup_file") or "")
+                dst = it.get("path") or ""
+                if dry_run:
+                    res["msgs"].append("[试运行] 还原文件：%s" % dst)
+                elif it.get("backup_file") and os.path.isfile(src) and dst:
+                    try:
+                        with open(src, "rb") as fp_:
+                            data = fp_.read()
+                        _write_file_keep_attr(dst, data)
+                        if k == "hosts":
+                            _run(["ipconfig", "/flushdns"], timeout=15)
+                        res["msgs"].append("已还原：%s" % dst)
+                    except OSError as e:
+                        res["ok"] = False
+                        res["msgs"].append("还原失败：%s（%s）" % (dst, e))
+                else:
+                    res["ok"] = False
+                    res["msgs"].append("备份里缺少原文件，无法还原：%s" % dst)
             elif k == "startup_delete":
                 name = it.get("name", "")
                 if dry_run:
