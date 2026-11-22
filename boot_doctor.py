@@ -1805,6 +1805,8 @@ class MainWindow(QMainWindow):
         self.nav.setFixedWidth(132)
         self.nav.setIconSize(QSize(16, 16))
         self.nav.setFocusPolicy(Qt.NoFocus)
+        self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.nav.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         body.addWidget(self.nav)
         self.pages = QStackedWidget()
         body.addWidget(self.pages, 1)
