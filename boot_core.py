@@ -4378,6 +4378,46 @@ def analyze(raw):
                  "items": [{"hive": x["hive"], "kind": x["kind"], "name": x["name"]} for x in upd]},
             default=True)
 
+    # ---------------- 开机自启：第三方的开机 / 登录计划任务 ----------------
+    # 全家桶最爱用计划任务自启：任务管理器的「启动应用」里看不到，以前这里也只统计个数。
+    # 现在逐条列出、带程序 / 发布者 / 签名，可以直接禁止（Disable-ScheduledTask，可还原）。
+    for tp in (sysd.get("tasks") or []):
+        if not isinstance(tp, str) or tp.lower().startswith("\\microsoft\\") \
+                or _OWN_AUTOSTART.search(tp):
+            continue
+        tcmd = _task_command(tp)
+        if tcmd:
+            _exe, _args = split_cmdline(tcmd)
+            _kapp = describe_app(_exe, _args)
+        else:
+            _kapp = {}
+        if _kapp and is_microsoft(_kapp):
+            continue                                    # OneDrive / Edge 更新这类微软自家任务
+        tname = tp.rsplit("\\", 1)[-1]
+        _hit = adware_check(path=(_kapp or {}).get("path", ""), name=tname,
+                            company=(_kapp or {}).get("company", ""), cmd=tcmd)
+        _detail = ("计划任务『%s』会在开机或登录时自动运行，任务管理器的「启动应用」里看不到它。\n\n"
+                   "● 禁止启动：Disable-ScheduledTask，任务定义原样保留，只是不再触发；\n"
+                   "  随时可在「任务计划程序」里重新启用，或用本工具『还原』。\n\n"
+                   "任务：%s\n命令：%s") % (tname, tp, tcmd or "（需要管理员权限才能读到）")
+        if _hit.get("hit"):
+            _detail = "命中流氓软件特征库：%s\n\n" % _hit.get("label", "") + _detail
+        _tfix = {"type": "task_off", "risk": "safe", "items": [tp]}
+        add(id="task_item@" + tp, cat="开机自启", sev="mid" if _hit.get("hit") else "info",
+            name=tname, src="计划任务",
+            title="计划任务：%s" % tname,
+            short=("流氓软件：%s" % _hit.get("label", "")) if _hit.get("hit") else "开机 / 登录时运行",
+            impact="开机 / 登录时不再拉起",
+            app=_kapp or None,
+            detail=_detail,
+            fix=dict(_tfix),
+            opts={"block": {"title": "计划任务：%s" % tname,
+                            "short": "禁止触发（任务保留）",
+                            "impact": "开机 / 登录时不再拉起",
+                            "detail": _detail,
+                            "fix": dict(_tfix)}},
+            default=False)
+
     # ---------------- 延迟启动（可选优化） ----------------
     # 每个对象都提供「延迟 / 禁止 / 删除」三种取舍（服务不提供删除：删服务键风险太高，
     # 失效残留走『服务与残留』分类）。勾选后按所选方式执行，互不影响。
@@ -5226,15 +5266,29 @@ def _drop_approved(name, hive, kind):
         pass
 
 
+def split_task_path(task):
+    """「\\厂商\\任务名」→ ("\\厂商\\", "任务名")；不带路径的当根目录任务。
+
+    *-ScheduledTask 的 -TaskName 只认名字，子目录里的任务必须另给 -TaskPath，
+    否则找不到（以前只处理过根目录里的延迟任务，所以没暴露）。
+    """
+    t = (task or "").strip()
+    if "\\" not in t:
+        return "\\", t
+    i = t.rfind("\\")
+    path = t[:i + 1]
+    return (path if path.startswith("\\") else "\\" + path), t[i + 1:]
+
+
 def _set_task_enabled(task_name, on, dry_run=False):
-    """启用 / 禁止计划任务（任务定义保留，只是不触发）。"""
+    """启用 / 禁止计划任务（任务定义保留，只是不触发）。task_name 可带路径。"""
     if dry_run:
         return True, "[试运行] %s任务：%s" % ("启用" if on else "禁止", task_name)
     env = dict(os.environ)
-    env["BD_TASK"] = task_name
+    env["BD_TPATH"], env["BD_TASK"] = split_task_path(task_name)
     cmd = "Enable-ScheduledTask" if on else "Disable-ScheduledTask"
-    out = run_ps("%s -TaskName $env:BD_TASK -ErrorAction Stop | Out-Null; 'OK'" % cmd,
-                 timeout=60, env=env)
+    out = run_ps("%s -TaskName $env:BD_TASK -TaskPath $env:BD_TPATH -ErrorAction Stop | Out-Null; 'OK'"
+                 % cmd, timeout=60, env=env)
     if "OK" in out:
         return True, ("已启用任务：%s" if on else "已禁止任务：%s") % task_name
     return False, "任务%s失败：%s（%s）" % ("启用" if on else "禁止", task_name, out.strip()[:160])

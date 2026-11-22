@@ -290,7 +290,7 @@ class TestGuiOffscreen(unittest.TestCase):
         dlg = bd.PopupDialog()
         self.assertEqual(dlg.tree.columnCount(), 5)
         self.assertEqual(dlg.watch.columnCount(), 5)
-        self.assertEqual(dlg.tabs.count(), 2)
+        self.assertEqual(dlg.tabs.count(), 3)            # 当前窗口 / 窗口记录 / 自启变动
         self.assertTrue(dlg.btn_guard.text() in ("开始后台拦截", "停止后台拦截"))
         self.assertIn("守护：", dlg.lbl_guard.text())
         self.assertIn("开机自启", dlg.lbl_guard.text())
@@ -1759,6 +1759,71 @@ class TestAutostartWatch(unittest.TestCase):
             finally:
                 win.close()
                 bc.AUTOSTART_WATCH_LOG = old
+
+
+class TestThirdPartyTasks(unittest.TestCase):
+    """第三方开机/登录计划任务：能列出、能禁止、能恢复。真注册一个测试任务（指向不存在的程序）。"""
+    TP = "\\BootDoctorUnitTest\\"
+    TN = "Probe"
+    EXE = r"C:\BootDoctorUnitTest\not_exist.exe"
+
+    def test_split_task_path(self):
+        self.assertEqual(bc.split_task_path(r"\Vendor\Sub\Task"), ("\\Vendor\\Sub\\", "Task"))
+        self.assertEqual(bc.split_task_path(r"\RootTask"), ("\\", "RootTask"))
+        self.assertEqual(bc.split_task_path("BootDoctor-Delay-X"), ("\\", "BootDoctor-Delay-X"))
+
+    def _ps(self, script):
+        env = dict(os.environ, BD_TPATH=self.TP, BD_TASK=self.TN, BD_EXE=self.EXE)
+        return bc.run_ps(script, timeout=90, env=env)
+
+    def setUp(self):
+        if not bc.is_admin():
+            self.skipTest("读 System32\\Tasks 需要管理员")
+        out = self._ps("Register-ScheduledTask -TaskName $env:BD_TASK -TaskPath $env:BD_TPATH "
+                       "-Action (New-ScheduledTaskAction -Execute $env:BD_EXE -Argument '--probe') "
+                       "-Trigger (New-ScheduledTaskTrigger -AtLogOn) -Force | Out-Null; 'OK'")
+        self.assertIn("OK", out, "注册测试任务失败")
+
+    def tearDown(self):
+        self._ps("Unregister-ScheduledTask -TaskName $env:BD_TASK -TaskPath $env:BD_TPATH "
+                 "-Confirm:$false -ErrorAction SilentlyContinue")
+
+    def test_list_analyze_disable_enable(self):
+        full = self.TP + self.TN
+        self.assertIn(full, bc.boot_logon_tasks_from_xml())
+        self.assertEqual(bc._task_command(full), self.EXE + " --probe")
+        raw = fake_raw()
+        raw["sys"]["tasks"] = [full, r"\Microsoft\Windows\Something\Ms"]
+        res = bc.analyze(raw)
+        f = next((x for x in res["findings"] if x["id"] == "task_item@" + full), None)
+        self.assertIsNotNone(f, "第三方开机任务没出现在体检结果里")
+        self.assertEqual(f["cat"], "开机自启")
+        self.assertEqual(set(f["opts"]), {"block"})
+        self.assertEqual(f["fix"], {"type": "task_off", "risk": "safe", "items": [full]})
+        self.assertFalse(any(x["id"].startswith("task_item@\\Microsoft") for x in res["findings"]),
+                         "微软自家任务不该列出来")
+
+        ok, msg = bc._set_task_enabled(full, False)
+        self.assertTrue(ok, msg)
+        self.assertNotIn(full, bc.boot_logon_tasks_from_xml(), "禁止后还在开机任务列表里")
+        ok, msg = bc._set_task_enabled(full, True)
+        self.assertTrue(ok, msg)
+        self.assertIn(full, bc.boot_logon_tasks_from_xml())
+
+    def test_backup_restore_roundtrip(self):
+        """走完整的 备份 → 执行 → 还原 流程，和界面上点「智能优化」「还原」一样。"""
+        full = self.TP + self.TN
+        f = {"id": "task_item@" + full, "title": "t",
+             "fix": {"type": "task_off", "risk": "safe", "items": [full]}}
+        with tempfile.TemporaryDirectory() as td:
+            bdir = bc.make_backup([f], backup_root=td, tag="ut")
+            res = bc.apply_fixes([f], bdir)
+            self.assertTrue(all(r.get("ok", True) for r in (res if isinstance(res, list) else [res])),
+                            res)
+            self.assertNotIn(full, bc.boot_logon_tasks_from_xml())
+            rr = bc.restore_backup(bdir)
+            self.assertTrue(rr, "还原没有返回结果")
+            self.assertIn(full, bc.boot_logon_tasks_from_xml(), "还原后任务没有重新启用")
 
 
 class TestLauncher(unittest.TestCase):
