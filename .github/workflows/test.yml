@@ -31,7 +31,7 @@ jobs:
       - name: 界面截图
         if: always() && github.event_name == 'push'
         env:
-          QT_QPA_FONTDIR: C:\Windows\Fonts     # 离屏平台默认不带字体库，不指一下截出来全是空白
+          QT_QPA_FONTDIR: "C:/Windows/Fonts"   # 离屏平台默认不带字体库，不指一下截出来全是空白
         run: python .github/ci_annotate.py shots python _ui_pages_shot.py
       - name: 截图推到 ci-shots 分支（每次覆盖，只留最新一次）
         if: always() && github.event_name == 'push'
