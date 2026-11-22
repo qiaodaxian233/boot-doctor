@@ -3931,24 +3931,46 @@ class MainWindow(QMainWindow):
 
     @guard
     def on_elevate(self):
-        script = os.path.abspath(sys.argv[0])
-        exe = sys.executable
-        pwx = os.path.join(os.path.dirname(exe), "pythonw.exe")
-        if os.path.exists(pwx):
-            exe = pwx
-        try:
-            ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", exe, '"%s"' % script,
-                os.path.dirname(script), 1)
+        # 以前不看 ShellExecuteW 的返回值：用户在 UAC 里点「否」，程序也照样退出了
+        ok, err = relaunch_elevated()
+        if ok:
             QApplication.quit()
-        except Exception as e:
-            QMessageBox.warning(self, "提权失败", "无法以管理员身份重启：%s" % e)
+        elif err:
+            QMessageBox.warning(self, "提权失败", "无法以管理员身份重启：%s" % err)
 
     def closeEvent(self, event):
         event.accept()
 
 
+def relaunch_elevated():
+    """用 ShellExecute runas 以管理员身份重新拉起本程序。返回 (是否已拉起, 错误说明)。
+
+    用户在 UAC 里点「否」返回 (False, "")：调用方继续以普通权限运行即可。
+    """
+    script = os.path.abspath(__file__)
+    exe = sys.executable
+    pwx = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    if os.path.exists(pwx):
+        exe = pwx
+    args = subprocess.list2cmdline([script, "--no-elevate"] +
+                                   [a for a in sys.argv[1:] if a != "--no-elevate"])
+    try:
+        rc = int(ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, args,
+                                                     os.path.dirname(script), 1))
+    except Exception as e:
+        return False, str(e)
+    if rc > 32:
+        return True, ""
+    return False, "" if rc == 5 else "ShellExecute 返回 %d" % rc   # 5 = 用户拒绝 UAC
+
+
 def main():
+    # 提权放在程序里做：启动体检.bat 不再先起一个 PowerShell 去 Start-Process -Verb RunAs，
+    # 打开快约 1 秒；用户拒绝 UAC 时以普通权限继续（界面上有「以管理员身份重启」）
+    if not bc.is_admin() and "--no-elevate" not in sys.argv \
+            and not os.environ.get("BOOTDOC_NO_ELEVATE"):
+        if relaunch_elevated()[0]:
+            return
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     sys.excepthook = _excepthook

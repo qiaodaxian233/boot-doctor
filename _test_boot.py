@@ -1533,5 +1533,28 @@ class TestEventsQuery(unittest.TestCase):
         self.assertEqual([x.get("msg") for x in _as_list(new.get("scm"))],
                          [x.get("msg") for x in _as_list(old.get("scm"))])
 
+
+class TestLauncher(unittest.TestCase):
+    def test_bat_finds_python(self):
+        """启动体检.bat 去掉了写死的路径兜底后，必须还能找到 pythonw（真跑一遍 bat 的查找逻辑）。"""
+        import subprocess
+        src = os.path.join(BASE, "启动体检.bat")
+        with open(src, "rb") as fp:
+            data = fp.read()
+        lines = data.split(b"\n")
+        probe = [ln for ln in lines if not ln.lstrip().lower().startswith(b"start ")]
+        probe.insert(len(probe) - 1, b'echo PY=[%PY%]')
+        with tempfile.TemporaryDirectory() as td:
+            bat = os.path.join(td, "probe.bat")
+            with open(bat, "wb") as fp:
+                fp.write(b"\r\n".join(x.rstrip(b"\r") for x in probe))
+            out = subprocess.run(["cmd", "/c", bat], capture_output=True, cwd=td,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        txt = out.stdout.decode("gbk", "replace")
+        m = [ln for ln in txt.splitlines() if ln.startswith("PY=[")]
+        self.assertTrue(m, txt[-500:])
+        self.assertRegex(m[0].lower(), r"pythonw?\.exe\]|pyw(\.exe)?\]", txt[-500:])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
