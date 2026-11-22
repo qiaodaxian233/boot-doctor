@@ -290,7 +290,7 @@ class TestGuiOffscreen(unittest.TestCase):
         dlg = bd.PopupDialog()
         self.assertEqual(dlg.tree.columnCount(), 5)
         self.assertEqual(dlg.watch.columnCount(), 5)
-        self.assertEqual(dlg.tabs.count(), 3)            # 当前窗口 / 窗口记录 / 自启变动
+        self.assertEqual(dlg.tabs.count(), 4)            # 当前窗口 / 窗口记录 / 自启变动 / 新进程
         self.assertTrue(dlg.btn_guard.text() in ("开始后台拦截", "停止后台拦截"))
         self.assertIn("守护：", dlg.lbl_guard.text())
         self.assertIn("开机自启", dlg.lbl_guard.text())
@@ -2523,14 +2523,31 @@ class _TestWindow(object):
             pass
 
 
-class TestGuardE2E(unittest.TestCase):
-    """真正的 popup_guard.py 进程：事件钩子、规则热加载、系统窗口豁免、新增自启提醒、停止。
+class _GuardE2EBase(unittest.TestCase):
+    """真正的 popup_guard.py 进程的测试底座：数据隔离到临时目录，按真实平台（非离屏）启动守护。
+
+    子类可覆盖 make_rules() / make_env() / before_start()。
 
     以前「守护」只有一个替身脚本的测试，真正的守护进程从没在 Windows 上跑过。
     数据（规则 / 日志 / pid）通过 BOOTDOC_DATA_DIR 隔离到临时目录。
     """
     PROBE = "BootDoctorE2EProbe"
     RUN = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+    @classmethod
+    def make_rules(cls):
+        return {"enabled": True, "auto_adware": False, "poll_ms": 1200, "watch_autostart": True,
+                "watch_process": False,
+                "block": [{"kind": "title", "pattern": "BootDoctorE2EPopup", "note": "e2e"}],
+                "allow": []}
+
+    @classmethod
+    def make_env(cls):
+        return {}
+
+    @classmethod
+    def before_start(cls):
+        pass
 
     @classmethod
     def setUpClass(cls):
@@ -2540,7 +2557,8 @@ class TestGuardE2E(unittest.TestCase):
         os.environ["BOOTDOC_DATA_DIR"] = cls.td                  # 子进程继承
         cls._saved = {k: getattr(bc, k) for k in ("DATA_DIR", "LOG_DIR", "POPUP_RULES_PATH",
                                                     "GUARD_PID_PATH", "GUARD_STOP_PATH",
-                                                    "AUTOSTART_BASELINE", "AUTOSTART_WATCH_LOG")}
+                                                    "AUTOSTART_BASELINE", "AUTOSTART_WATCH_LOG",
+                                                    "PROC_WATCH_LOG")}
         bc.DATA_DIR = cls.td
         bc.LOG_DIR = os.path.join(cls.td, "_logs")
         bc.POPUP_RULES_PATH = os.path.join(cls.td, "_popup_rules.json")
@@ -2548,13 +2566,16 @@ class TestGuardE2E(unittest.TestCase):
         bc.GUARD_STOP_PATH = os.path.join(bc.LOG_DIR, "popup_guard.stop")
         bc.AUTOSTART_BASELINE = os.path.join(bc.LOG_DIR, "autostart_baseline.json")
         bc.AUTOSTART_WATCH_LOG = os.path.join(bc.LOG_DIR, "autostart_watch.log")
+        bc.PROC_WATCH_LOG = os.path.join(bc.LOG_DIR, "process_watch.log")
         os.makedirs(bc.LOG_DIR, exist_ok=True)
-        cls.rules = {"enabled": True, "auto_adware": False, "poll_ms": 1200, "watch_autostart": True,
-                     "block": [{"kind": "title", "pattern": "BootDoctorE2EPopup", "note": "e2e"}],
-                     "allow": []}
+        cls.rules = cls.make_rules()
         assert bc.save_popup_rules(cls.rules)
+        cls._extra_env = cls.make_env()
+        cls._env_before = {k: os.environ.get(k) for k in cls._extra_env}
+        os.environ.update(cls._extra_env)
         cls._qpa = os.environ.pop("QT_QPA_PLATFORM", None)        # 守护按真实平台跑，不是离屏
         cls.windows = []
+        cls.before_start()
         try:
             ok, msg = bc.start_popup_guard()
         finally:
@@ -2595,6 +2616,11 @@ class TestGuardE2E(unittest.TestCase):
                     ctypes.windll.kernel32.CloseHandle(h)
             for k, v in cls._saved.items():
                 setattr(bc, k, v)
+            for k, v in cls._env_before.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
             if cls._env is None:
                 os.environ.pop("BOOTDOC_DATA_DIR", None)
             else:
@@ -2613,6 +2639,10 @@ class TestGuardE2E(unittest.TestCase):
         w = _TestWindow(title, cls).start()
         self.windows.append(w)
         return w
+
+
+class TestGuardE2E(_GuardE2EBase):
+    """弹窗拦截 / 自启监控 / 停止（原来的端到端用例）。"""
 
     def test_a_guard_is_running_with_hook(self):
         self.assertTrue(bc.guard_running())
@@ -2965,6 +2995,529 @@ class TestRunningProcessScan(unittest.TestCase):
         ok, msg = bc.kill_process(os.getpid(), 0, sys.executable)
         self.assertFalse(ok)
         self.assertIn("不允许", msg)
+
+
+class TestJudgeNewProcess(unittest.TestCase):
+    """新进程判定：默认只报高把握的两类，严格模式才多报「未签名 + 从 Temp / AppData 启动」。"""
+
+    def setUp(self):
+        self._saved = (bc.adware_check, bc.ms_spoof_verdict, bc.app_signature)
+        self.td = tempfile.mkdtemp()
+        self.exe = os.path.join(self.td, "AppData", "Local", "Temp", "x.exe")
+        os.makedirs(os.path.dirname(self.exe))
+        with open(self.exe, "wb") as fp:
+            fp.write(b"MZ")
+        self.proc = {"pid": 4321, "ctime": 99, "name": "x.exe", "path": self.exe, "company": ""}
+        bc.adware_check = lambda **kw: {"hit": False}
+        bc.ms_spoof_verdict = lambda app: None
+        bc.app_signature = lambda app: {"state": "unsigned"}
+
+    def tearDown(self):
+        bc.adware_check, bc.ms_spoof_verdict, bc.app_signature = self._saved
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_adware_hit(self):
+        bc.adware_check = lambda **kw: {"hit": True, "family": "ludashi", "label": "鲁大师全家桶",
+                                         "sev": "mid", "why": "测试"}
+        v = bc.judge_new_process(self.proc)
+        self.assertEqual((v["level"], v["sev"], v["label"], v["family"]), ("adware", "mid", "鲁大师全家桶", "ludashi"))
+        self.assertEqual((v["pid"], v["ctime"], v["path"]), (4321, 99, self.exe))
+
+    def test_spoof_hit(self):
+        bc.ms_spoof_verdict = lambda app: ("high", "签名者是别人")
+        v = bc.judge_new_process(dict(self.proc, company="Microsoft Corporation"))
+        self.assertEqual((v["level"], v["sev"]), ("spoof", "high"))
+
+    def test_unsigned_in_temp_only_in_strict_mode(self):
+        self.assertIsNone(bc.judge_new_process(self.proc), "默认模式不该为「未签名」提醒")
+        v = bc.judge_new_process(self.proc, strict=True)
+        self.assertEqual((v["level"], v["sev"]), ("unsigned", "low"))
+        bc.app_signature = lambda app: {"state": "valid", "signer": "Some Ltd"}
+        self.assertIsNone(bc.judge_new_process(self.proc, strict=True), "有签名的不报")
+        bc.app_signature = lambda app: {"state": "unsigned"}
+        old_zone = bc._in_user_dropzone
+        bc._in_user_dropzone = lambda p: False     # 临时目录本身就在 AppData\\Temp 下，所以打桩模拟「别处」
+        try:
+            self.assertIsNone(bc.judge_new_process(self.proc, strict=True), "不在 Temp / AppData 一类位置的不报")
+        finally:
+            bc._in_user_dropzone = old_zone
+
+    def test_system_dir_and_missing_file_ignored(self):
+        sysexe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+        bc.adware_check = lambda **kw: {"hit": True, "label": "x", "sev": "high", "why": "x"}
+        self.assertIsNone(bc.judge_new_process(dict(self.proc, path=sysexe)), "系统目录一律不判")
+        bc.adware_check = lambda **kw: {"hit": False}
+        self.assertIsNone(bc.judge_new_process(dict(self.proc, path=r"D:\gone\z.exe"), strict=True))
+
+    def test_dropzone(self):
+        z = bc._in_user_dropzone
+        for p in (r"C:\Users\u\AppData\Local\Temp\a.exe", r"C:\Users\u\AppData\Roaming\x\a.exe",
+                  os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "x", "a.exe"),
+                  os.path.join(os.environ.get("PUBLIC", r"C:\Users\Public"), "a.exe")):
+            self.assertTrue(z(p), p)
+        for p in (r"C:\Users\u\Downloads\a.exe", r"C:\Program Files\x\a.exe", r"D:\Tools\a.exe"):
+            self.assertFalse(z(p), p)
+
+    def test_log_roundtrip_newest_first(self):
+        lp = os.path.join(self.td, "pw.log")
+        bc.append_proc_watch([{"t": "1", "name": "a"}, {"t": "2", "name": "b"}], path=lp)
+        bc.append_proc_watch([{"t": "3", "name": "c"}], path=lp)
+        self.assertEqual([r["name"] for r in bc.proc_watch_log(10, path=lp)], ["c", "b", "a"])
+        self.assertEqual(bc.proc_watch_log(10, path=os.path.join(self.td, "none.log")), [])
+
+    def test_rule_defaults_and_load(self):
+        d = bc.DEFAULT_POPUP_RULES
+        self.assertTrue(d["watch_process"])
+        self.assertFalse(d["auto_kill_adware"], "自动结束进程必须默认关")
+        self.assertFalse(d["watch_strict"])
+        rp = os.path.join(self.td, "r.json")
+        json.dump({"enabled": True, "auto_kill_adware": True, "watch_strict": True, "watch_process": False},
+                  open(rp, "w", encoding="utf-8"))
+        r = bc.load_popup_rules(rp)
+        self.assertEqual((r["auto_kill_adware"], r["watch_strict"], r["watch_process"]), (True, True, False))
+
+    def test_gui_tab_toggles_and_confirm(self):
+        from PyQt5.QtWidgets import QApplication, QMessageBox
+        import boot_doctor as bd
+        app = QApplication.instance() or QApplication([])  # noqa: F841
+        old = (bc.POPUP_RULES_PATH, bc.PROC_WATCH_LOG, QMessageBox.question)
+        bc.POPUP_RULES_PATH = os.path.join(self.td, "_popup_rules.json")
+        bc.PROC_WATCH_LOG = os.path.join(self.td, "process_watch.log")
+        bc.append_proc_watch([{"t": "2026-11-22 12:00:00", "level": "adware", "sev": "mid", "label": "鲁大师",
+                               "name": "lds.exe", "path": r"C:\x\lds.exe", "why": "命中", "action": "已结束"}])
+        try:
+            dlg = bd.PopupDialog()
+            self.assertEqual(dlg.tabs.count(), 4)
+            dlg.tabs.setCurrentIndex(3)
+            self.assertEqual(dlg.pw_tree.topLevelItemCount(), 1)
+            self.assertIn("(1)", dlg.tabs.tabText(3))
+            self.assertTrue(dlg.chk_watch_proc.isChecked())
+            self.assertFalse(dlg.chk_autokill.isChecked())
+            dlg.chk_strict.setChecked(True)
+            self.assertTrue(bc.load_popup_rules()["watch_strict"])
+            QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.No)
+            dlg.chk_autokill.setChecked(True)
+            self.assertFalse(dlg.chk_autokill.isChecked(), "点了「否」应当回到未勾选")
+            self.assertFalse(bc.load_popup_rules()["auto_kill_adware"])
+            QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+            dlg.chk_autokill.setChecked(True)
+            self.assertTrue(bc.load_popup_rules()["auto_kill_adware"])
+            dlg.chk_watch_proc.setChecked(False)
+            self.assertFalse(bc.load_popup_rules()["watch_process"])
+            dlg.close()
+        finally:
+            bc.POPUP_RULES_PATH, bc.PROC_WATCH_LOG, QMessageBox.question = old
+
+
+class TestProcWatchE2E(_GuardE2EBase):
+    """真守护进程 + 真子进程：基线不报、新进程命中特征库提醒、自动结束、总开关。
+
+    用 BOOTDOC_ADWARE_DB 给守护一份只含「python 所在目录」的自定义特征库，
+    这样真的 python.exe 子进程就是「命中特征库的新进程」。
+    """
+    @classmethod
+    def _db_key(cls):
+        segs = [x for x in os.path.dirname(sys.executable).split("\\") if len(x) >= 4]
+        common = {"programs", "program", "windows", "local", "python", "users", "tools", "temp", "appdata"}
+        good = [x for x in segs if x.lower() not in common]
+        return max(good or segs, key=len)
+
+    @classmethod
+    def make_rules(cls):
+        r = super().make_rules()
+        r.update({"watch_process": True, "auto_kill_adware": False, "block": []})
+        return r
+
+    @classmethod
+    def make_env(cls):
+        db = os.path.join(cls.td, "e2e_db.json")
+        with open(db, "w", encoding="utf-8") as fp:
+            json.dump({"version": 2, "updated": "2026-11-22", "dirs": {cls._db_key(): "E2E 测试软件"},
+                       "pubs": [], "families": [], "white": []}, fp, ensure_ascii=False)
+        return {"BOOTDOC_ADWARE_DB": db}
+
+    @classmethod
+    def before_start(cls):
+        import subprocess
+        cls.kids = []
+        cls.early = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"],
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        cls.kids.append(cls.early)
+
+    @classmethod
+    def tearDownClass(cls):
+        for k in getattr(cls, "kids", []):
+            try:
+                k.kill()
+            except Exception:
+                pass
+        super().tearDownClass()
+
+    def _spawn(self):
+        import subprocess
+        k = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"],
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        self.kids.append(k)
+        return k
+
+    def _wait(self, cond, timeout=15):
+        import time as _t
+        end = _t.time() + timeout
+        while _t.time() < end:
+            v = cond()
+            if v:
+                return v
+            _t.sleep(0.25)
+        return None
+
+    def _rows_for(self, pid_path=None):
+        return [r for r in bc.proc_watch_log(200) if os.path.normcase(r.get("path", "")) == os.path.normcase(sys.executable)]
+
+    def test_a_baseline_then_new_process_alerted(self):
+        self.assertTrue(self._wait(lambda: "新进程监控已启动" in self.log()), "监控没启动：\n" + self.log())
+        self.assertEqual(self._rows_for(), [], "守护启动前就在跑的进程不该提醒（基线）")
+        self.assertIsNone(self.early.poll(), "基线里的进程还活着")
+        k = self._spawn()
+        row = self._wait(lambda: self._rows_for())
+        self.assertTrue(row, "新进程没被提醒。日志：\n" + self.log())
+        r = row[0]
+        self.assertEqual((r["level"], r["action"]), ("adware", "提醒"))
+        self.assertIn("E2E 测试软件", r["label"] + r["why"])
+        self.assertIsNone(k.poll(), "没开自动结束，进程不该被动")
+        self.assertIn("命中特征库", self.log())
+
+    def test_b_auto_kill_only_new_processes(self):
+        import time as _t
+        rules = dict(self.rules, auto_kill_adware=True)
+        self.assertTrue(bc.save_popup_rules(rules))
+        os.utime(bc.POPUP_RULES_PATH, (_t.time() + 5, _t.time() + 5))
+        _t.sleep(3.2)                                   # 守护每 1.5 秒重读一次规则
+        before_alive = [k for k in self.kids if k.poll() is None]
+        k = self._spawn()
+        self.assertTrue(self._wait(lambda: k.poll() is not None), "开了自动结束，新进程还活着。日志：\n" + self.log())
+        self.assertTrue(self._wait(lambda: any(r["action"] == "已结束" for r in self._rows_for())),
+                        "记录里没有「已结束」：%r" % self._rows_for()[:3])
+        # 守护启动前的进程、以及开自动结束之前就在的进程，都不该被追杀
+        self.assertIsNone(self.early.poll(), "基线进程被追杀了")
+        self.assertTrue(bc.guard_running(), "守护自己不能死")
+        for b in before_alive:
+            self.assertIsNone(b.poll(), "开自动结束之前就在运行的进程被追杀了")
+
+    def test_d_db_reloaded_without_restart(self):
+        """主程序自动更新了特征库文件：长期运行的守护不用重启就该用上新库（换成不匹配的库 → 不再提醒；换回来 → 又提醒）。"""
+        import time as _t
+        rules = dict(self.rules, watch_process=True, auto_kill_adware=False)
+        self.assertTrue(bc.save_popup_rules(rules))
+        os.utime(bc.POPUP_RULES_PATH, (_t.time() + 20, _t.time() + 20))
+        db = os.environ["BOOTDOC_ADWARE_DB"]
+        original = open(db, encoding="utf-8").read()
+        _t.sleep(3.2)
+        try:
+            with open(db, "w", encoding="utf-8") as fp:
+                json.dump({"version": 3, "dirs": {"zzzzunmatched": "x"}, "pubs": [], "families": [], "white": []}, fp)
+            os.utime(db, (_t.time() + 30, _t.time() + 30))
+            _t.sleep(3.5)
+            n0 = len(self._rows_for())
+            self._spawn()
+            _t.sleep(5)
+            self.assertEqual(len(self._rows_for()), n0, "库换成不匹配的了，守护还在用旧库提醒")
+            with open(db, "w", encoding="utf-8") as fp:
+                fp.write(original)
+            os.utime(db, (_t.time() + 40, _t.time() + 40))
+            _t.sleep(3.5)
+            self._spawn()
+            self.assertTrue(self._wait(lambda: len(self._rows_for()) > n0), "库换回来了，守护没有重新加载。日志：\n" + self.log())
+            self.assertIn("特征库文件已更新，已重新加载", self.log())
+        finally:
+            with open(db, "w", encoding="utf-8") as fp:
+                fp.write(original)
+
+    def test_c_master_switch_off(self):
+        import time as _t
+        rules = dict(self.rules, watch_process=False, auto_kill_adware=True)
+        self.assertTrue(bc.save_popup_rules(rules))
+        os.utime(bc.POPUP_RULES_PATH, (_t.time() + 10, _t.time() + 10))
+        _t.sleep(3.2)
+        n0 = len(self._rows_for())
+        k = self._spawn()
+        _t.sleep(5)
+        self.assertIsNone(k.poll(), "关了新进程监控，进程不该被动")
+        self.assertEqual(len(self._rows_for()), n0, "关了监控不该再有记录")
+
+
+class TestExtensionCheck(unittest.TestCase):
+    """被别的程序通过注册表登记进 Chrome / Edge 的扩展。"""
+    BASE = r"Software\BootDoctorUnitTest\Ext"
+    IDS = {k: ch * 32 for k, ch in (("store", "a"), ("bad", "b"), ("mid", "c"), ("crx", "d"),
+                                      ("gone", "e"), ("nested", "f"))}
+
+    def setUp(self):
+        import winreg
+        self.W = winreg
+        bc._delete_key_tree(winreg.HKEY_CURRENT_USER, r"Software\BootDoctorUnitTest")
+        self.td = tempfile.mkdtemp()
+        self.crx = os.path.join(self.td, "x.crx")
+        open(self.crx, "wb").write(b"Cr24")
+
+        def mk(name, **vals):
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, self.BASE + "\\" + name, 0, winreg.KEY_SET_VALUE) as k:
+                for vn, vv in vals.items():
+                    winreg.SetValueEx(k, vn, 0, winreg.REG_SZ, vv)
+        mk(self.IDS["store"], update_url="https://clients2.google.com/service/update2/crx")
+        mk(self.IDS["bad"], update_url="http://ext.bad.example/update.xml")
+        mk(self.IDS["mid"], update_url="https://cdn.example.org/u.xml")
+        mk(self.IDS["crx"], path=self.crx, version="1.0")
+        mk(self.IDS["gone"], path=os.path.join(self.td, "nope.crx"), version="1.0")
+        mk("not-an-extension-id", update_url="https://x")
+        mk(self.IDS["nested"], update_url="https://cdn.example.org/n.xml")
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, self.BASE + "\\" + self.IDS["nested"] + "\\sub", 0,
+                                winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, "blob", 0, winreg.REG_BINARY, b"\x00\x01\xfe")
+            winreg.SetValueEx(k, "n", 0, winreg.REG_DWORD, 7)
+        self.roots = [("Chrome", "HKCU", self.BASE)]
+
+    def tearDown(self):
+        bc._delete_key_tree(self.W.HKEY_CURRENT_USER, r"Software\BootDoctorUnitTest")
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _rows(self):
+        return {r["ext_id"]: r for r in bc.read_external_extensions(self.roots)}
+
+    def test_read_ignores_non_ids(self):
+        rows = self._rows()
+        self.assertEqual(set(rows), set(self.IDS.values()), "非 32 位 a-p 的键名不是扩展 ID，应忽略")
+        self.assertEqual(rows[self.IDS["crx"]]["path"], self.crx)
+        self.assertEqual(rows[self.IDS["crx"]]["version"], "1.0")
+        self.assertEqual(rows[self.IDS["bad"]]["browser"], "Chrome")
+
+    def test_verdicts(self):
+        r = self._rows()
+        a = lambda k: bc.analyze_extension(r[self.IDS[k]])      # noqa: E731
+        self.assertEqual((a("store")["sev"], a("store")["store"]), ("info", True))
+        self.assertEqual((a("bad")["sev"], a("bad")["store"]), ("high", False), "明文 http 应高危")
+        self.assertEqual(a("mid")["sev"], "mid")
+        self.assertEqual(a("crx")["sev"], "high", "本地 crx 在 Temp 下应高危")
+        self.assertEqual(a("gone")["sev"], "low")
+        self.assertEqual(bc.analyze_extension({"update_url": "https://1.2.3.4/u.xml"})["sev"], "high", "IP 地址")
+        self.assertEqual(bc.analyze_extension({"update_url": "https://edge.microsoft.com/extensionwebstorebase/v1/crx"})["sev"], "info")
+
+    def _findings(self, managed=False):
+        got = []
+        d = {"managed": managed, "extensions": list(self._rows().values())}
+        bc._ext_findings(d, lambda **kw: got.append(kw))
+        return got
+
+    def test_findings_group_and_fix_only_suspicious(self):
+        got = self._findings()
+        self.assertEqual(len(got), 1)
+        f = got[0]
+        self.assertEqual((f["id"], f["cat"], f["sev"]), ("hij_ext@Chrome", "浏览器劫持", "high"))
+        self.assertFalse(f["default"])
+        subs = {it["subkey"].rsplit("\\", 1)[-1] for it in f["fix"]["items"]}
+        self.assertNotIn(self.IDS["store"], subs, "商店来源的只提示，不该进清除清单")
+        self.assertIn(self.IDS["bad"], subs)
+        self.assertIn("reg_key_delete", bc.FIX_DESC)
+        m = self._findings(managed=True)[0]
+        self.assertEqual(m["sev"], "info")
+        self.assertIsNone(m["fix"], "受管理的电脑不建议动")
+
+    def test_key_delete_backup_apply_restore_incl_nested_and_binary(self):
+        W = self.W
+        items = [{"hive": "HKCU", "subkey": self.BASE + "\\" + self.IDS[k]} for k in ("nested", "bad")]
+        f = {"id": "x", "title": "x", "fix": {"type": "reg_key_delete", "risk": "confirm", "items": items}}
+
+        def exists(name):
+            try:
+                W.CloseKey(W.OpenKey(W.HKEY_CURRENT_USER, self.BASE + "\\" + name))
+                return True
+            except OSError:
+                return False
+        with tempfile.TemporaryDirectory() as td:
+            bdir = bc.make_backup([f], backup_root=td, tag="ut")
+            res = bc.apply_fixes([f], bdir)
+            self.assertTrue(all(r["ok"] for r in res), res)
+            self.assertFalse(exists(self.IDS["nested"]) or exists(self.IDS["bad"]), "键没删掉")
+            self.assertTrue(exists(self.IDS["store"]), "别的键不能动")
+            self.assertIn("被删除的浏览器扩展注册项", open(os.path.join(bdir, "说明.txt"), encoding="utf-8").read())
+            rr = bc.restore_backup(bdir)
+            self.assertTrue(all(r["ok"] for r in rr), rr)
+        self.assertTrue(exists(self.IDS["nested"]) and exists(self.IDS["bad"]))
+        with W.OpenKey(W.HKEY_CURRENT_USER, self.BASE + "\\" + self.IDS["nested"] + "\\sub") as k:
+            self.assertEqual(W.QueryValueEx(k, "blob"), (b"\x00\x01\xfe", W.REG_BINARY))
+            self.assertEqual(W.QueryValueEx(k, "n"), (7, W.REG_DWORD))
+        with W.OpenKey(W.HKEY_CURRENT_USER, self.BASE + "\\" + self.IDS["bad"]) as k:
+            self.assertEqual(W.QueryValueEx(k, "update_url")[0], "http://ext.bad.example/update.xml")
+
+    def test_missing_key_is_not_a_failure(self):
+        ok, msg = bc._reg_key_delete_apply({"hive": "HKCU", "subkey": self.BASE + r"\zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"})
+        self.assertTrue(ok, msg)
+
+    def test_real_machine_and_analyze_integration(self):
+        rows = bc.read_external_extensions()
+        self.assertIsInstance(rows, list)
+        d = bc.collect_hijack()
+        self.assertIsInstance(d["extensions"], list)
+        raw = fake_raw()
+        raw["hijack"] = {"managed": False, "proxy": {}, "policies": [], "ie": [], "lnks": [], "hosts": {},
+                         "extensions": list(self._rows().values())}
+        res = bc.analyze(raw)
+        f = next((x for x in res["findings"] if x["id"] == "hij_ext@Chrome"), None)
+        self.assertIsNotNone(f)
+        self.assertIn(f["fix"]["type"], bc.FIX_DESC)
+
+
+class TestDbAutoUpdate(unittest.TestCase):
+    def setUp(self):
+        self._saved_settings = {k: bc.get_setting(k, None) for k in ("db_checked_at", "auto_update_db")}
+        self._saved_adb = (dict(bc._ADB), bc._ADB_MTIME[0], bc.ADWARE_DB_PATH)
+        self.td = tempfile.mkdtemp()
+
+    def tearDown(self):
+        for k, v in self._saved_settings.items():
+            bc.set_setting(k, v if v is not None else (0 if k == "db_checked_at" else True))
+        adb, mt, path = self._saved_adb
+        bc.ADWARE_DB_PATH = path
+        bc._ADB.clear()
+        bc._ADB.update(adb)
+        bc._ADB_MTIME[0] = mt
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_due_logic(self):
+        import time as _t
+        now = _t.time()
+        self.assertTrue(bc.db_auto_due(now=now, last=0))
+        self.assertFalse(bc.db_auto_due(now=now, last=now - 3600))
+        self.assertFalse(bc.db_auto_due(now=now, last=now - 19 * 3600))
+        self.assertTrue(bc.db_auto_due(now=now, last=now - 21 * 3600))
+        bc.set_setting("db_checked_at", now - 100)
+        self.assertFalse(bc.db_auto_due())
+
+    def test_reload_if_changed(self):
+        import time as _t
+        dbp = os.path.join(self.td, "db.json")
+
+        def write(key, mt):
+            with open(dbp, "w", encoding="utf-8") as fp:
+                json.dump({"version": 1, "dirs": {key: "测试"}, "pubs": [], "families": [], "white": []}, fp)
+            os.utime(dbp, (mt, mt))
+        bc.ADWARE_DB_PATH = dbp
+        bc._ADB.clear()
+        write("aaaa1111", _t.time() - 100)
+        self.assertIn("aaaa1111", bc.adware_db()["_dir_lower"])
+        self.assertFalse(bc.adware_db_reload_if_changed(), "没变化不该重新加载")
+        write("bbbb2222", _t.time())
+        self.assertTrue(bc.adware_db_reload_if_changed())
+        self.assertIn("bbbb2222", bc.adware_db()["_dir_lower"])
+        self.assertNotIn("aaaa1111", bc.adware_db()["_dir_lower"])
+        self.assertFalse(bc.adware_db_reload_if_changed())
+
+    def test_never_loaded_or_missing_is_safe(self):
+        bc._ADB.clear()
+        self.assertFalse(bc.adware_db_reload_if_changed())
+        bc.ADWARE_DB_PATH = os.path.join(self.td, "nope.json")
+        self.assertFalse(bc.adware_db_reload_if_changed())
+
+    def _window(self, rep):
+        from PyQt5.QtCore import QObject, pyqtSignal
+        from PyQt5.QtWidgets import QApplication
+        import boot_doctor as bd
+        self.app = QApplication.instance() or QApplication([])
+        created = []
+
+        class FakeW(QObject):
+            sig_progress = pyqtSignal(str)
+            sig_done = pyqtSignal(object)
+            sig_fail = pyqtSignal(str)
+
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                created.append(self)
+
+            def start(self):
+                self.sig_done.emit(rep)
+
+            def isRunning(self):
+                return False
+        self._old_worker = bd.DbUpdateWorker
+        bd.DbUpdateWorker = FakeW
+        self._bd = bd
+        win = bd.MainWindow(autoscan=False)
+        scans = []
+        win.start_scan = lambda: scans.append(1)
+        return win, created, scans
+
+    def _pump(self):
+        for _ in range(4):
+            self.app.processEvents()
+
+    def test_gui_flow(self):
+        import time as _t
+        from PyQt5.QtWidgets import QMessageBox
+        old_boxes = (QMessageBox.warning, QMessageBox.information, QMessageBox.critical, QMessageBox.question)
+        boom = staticmethod(lambda *a, **k: (_ for _ in ()).throw(AssertionError("自动更新不该弹窗")))
+        QMessageBox.warning = QMessageBox.information = QMessageBox.critical = QMessageBox.question = boom
+        try:
+            # 1) 真实启动之外（autoscan=False）：到期了也不联网
+            win, created, scans = self._window({"ok": True, "up_to_date": True, "version": 2})
+            try:
+                bc.set_setting("auto_update_db", True)
+                bc.set_setting("db_checked_at", 0)
+                win._maybe_auto_update_db(0)
+                self._pump()
+                self.assertEqual(created, [], "测试窗口不该联网")
+                # 2) 已是最新：记下检查时间，不重新体检
+                win._auto_checks = True
+                win._maybe_auto_update_db(0)
+                self._pump()
+                self.assertEqual(len(created), 1)
+                self.assertGreater(float(bc.get_setting("db_checked_at", 0)), _t.time() - 10)
+                self.assertEqual(scans, [])
+                # 同一次启动最多试一次
+                win._maybe_auto_update_db(0)
+                self._pump()
+                self.assertEqual(len(created), 1)
+            finally:
+                win.close()
+            # 3) 有新条目：状态栏提示 + 重新体检
+            win, created, scans = self._window({"ok": True, "up_to_date": False, "version": 3, "added_dirs": 3,
+                                                "added_pubs": 1, "source": "x", "updated": "2026-11-22"})
+            try:
+                win._auto_checks = True
+                bc.set_setting("db_checked_at", 0)
+                win._maybe_auto_update_db(0)
+                self._pump()
+                self.assertEqual(scans, [1], "有新条目应重新体检一次")
+                self.assertIn("新增 3", win.statusBar().currentMessage())
+            finally:
+                win.close()
+            # 4) 失败：不弹窗、不记「已检查」（下次启动再试）
+            win, created, scans = self._window({"ok": False, "error": "没网"})
+            try:
+                win._auto_checks = True
+                bc.set_setting("db_checked_at", 0)
+                win._maybe_auto_update_db(0)
+                self._pump()
+                self.assertEqual(len(created), 1)
+                self.assertEqual(float(bc.get_setting("db_checked_at", 0)), 0.0)
+                self.assertEqual(scans, [])
+            finally:
+                win.close()
+            # 5) 没到期 / 设置里关了：不联网
+            win, created, scans = self._window({"ok": True, "up_to_date": True, "version": 2})
+            try:
+                win._auto_checks = True
+                bc.set_setting("db_checked_at", _t.time())
+                win._maybe_auto_update_db(0)
+                bc.set_setting("db_checked_at", 0)
+                bc.set_setting("auto_update_db", False)
+                win._maybe_auto_update_db(0)
+                self._pump()
+                self.assertEqual(created, [])
+            finally:
+                win.close()
+        finally:
+            QMessageBox.warning, QMessageBox.information, QMessageBox.critical, QMessageBox.question = old_boxes
+            self._bd.DbUpdateWorker = self._old_worker
 
 
 if __name__ == "__main__":

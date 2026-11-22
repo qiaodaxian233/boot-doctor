@@ -937,6 +937,9 @@ class SettingsDialog(QDialog):
         self.chk_autoscan = QCheckBox("启动时自动体检")
         self.chk_autoscan.setChecked(bool(bc.get_setting("autoscan", True)))
         g.addWidget(self.chk_autoscan)
+        self.chk_dbauto = QCheckBox("启动时自动更新流氓软件特征库（最多每天一次，只下载 3 个公开文本）")
+        self.chk_dbauto.setChecked(bool(bc.get_setting("auto_update_db", True)))
+        g.addWidget(self.chk_dbauto)
         self.chk_lastscan = QCheckBox("启动时先显示上次的体检结果（后台再刷新）")
         self.chk_lastscan.setChecked(bool(bc.get_setting("show_last_scan", True)))
         g.addWidget(self.chk_lastscan)
@@ -983,6 +986,7 @@ class SettingsDialog(QDialog):
             "ai_timeout": self.sp_timeout.value(),
             "autoscan": self.chk_autoscan.isChecked(),
             "show_last_scan": self.chk_lastscan.isChecked(),
+            "auto_update_db": self.chk_dbauto.isChecked(),
             "autorefresh": self.chk_refresh.isChecked(),
             "theme": "dark" if self.rb_dark.isChecked() else "light",
         }
@@ -1173,10 +1177,53 @@ class PopupDialog(QDialog):
         av.addLayout(ab)
         av.addWidget(self.as_tree, 1)
 
+        # ---- 新进程：监控开关 + 提醒记录 ----
+        pr = bc.load_popup_rules()
+        self.pw_tree = QTreeWidget()
+        self.pw_tree.setColumnCount(6)
+        self.pw_tree.setHeaderLabels(["时间", "判定", "程序", "原因", "路径", "处理"])
+        self.pw_tree.setRootIsDecorated(False)
+        self.pw_tree.setAlternatingRowColors(True)
+        self.pw_tree.setUniformRowHeights(True)
+        ph = self.pw_tree.header()
+        for c in (0, 1, 5):
+            ph.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        for c in (2, 3):
+            ph.setSectionResizeMode(c, QHeaderView.Interactive)
+        ph.setSectionResizeMode(4, QHeaderView.Stretch)
+        self.pw_tree.setColumnWidth(2, 170)
+        self.pw_tree.setColumnWidth(3, 300)
+        pw_box = QWidget()
+        pv = QVBoxLayout(pw_box)
+        pv.setContentsMargins(0, 6, 0, 0)
+        pv.setSpacing(6)
+        self.chk_watch_proc = QCheckBox("监控新启动的程序：命中流氓软件特征库 / 冒充微软时，托盘立即提醒")
+        self.chk_watch_proc.setChecked(bool(pr.get("watch_process", True)))
+        self.chk_watch_proc.toggled.connect(lambda on: self.on_proc_opt("watch_process", on))
+        pv.addWidget(self.chk_watch_proc)
+        self.chk_autokill = QCheckBox("命中特征库的新进程自动结束（谨慎：无法还原，特征库偶尔有误报）")
+        self.chk_autokill.setChecked(bool(pr.get("auto_kill_adware", False)))
+        self.chk_autokill.toggled.connect(lambda on: self.on_proc_opt("auto_kill_adware", on))
+        pv.addWidget(self.chk_autokill)
+        self.chk_strict = QCheckBox("严格模式：没有数字签名、且从 Temp / AppData / ProgramData 启动的程序也提醒"
+                                    "（很多安装程序会解压到 Temp 运行，所以默认关）")
+        self.chk_strict.setChecked(bool(pr.get("watch_strict", False)))
+        self.chk_strict.toggled.connect(lambda on: self.on_proc_opt("watch_strict", on))
+        pv.addWidget(self.chk_strict)
+        pb = QHBoxLayout()
+        pb.addStretch(1)
+        self.btn_pw_vt = QPushButton("查 VirusTotal")
+        self.btn_pw_vt.setToolTip("在浏览器里打开选中程序的 VirusTotal 报告页（只发送 SHA-256，不上传文件）")
+        self.btn_pw_vt.clicked.connect(self.on_pw_virustotal)
+        pb.addWidget(self.btn_pw_vt)
+        pv.addLayout(pb)
+        pv.addWidget(self.pw_tree, 1)
+
         self.tabs = QTabWidget()
         self.tabs.addTab(self.tree, "当前窗口")
         self.tabs.addTab(self.watch, "窗口记录")
         self.tabs.addTab(as_box, "自启变动")
+        self.tabs.addTab(pw_box, "新进程")
         self.tabs.currentChanged.connect(self._on_tab)
         v.addWidget(self.tabs, 1)
 
@@ -1350,6 +1397,52 @@ class PopupDialog(QDialog):
             self._fill_watch()
         elif i == 2:
             self._fill_autostart()
+        elif i == 3:
+            self._fill_procwatch()
+
+    def _fill_procwatch(self):
+        rows = bc.proc_watch_log(200)
+        self.pw_tree.clear()
+        for r in rows:
+            ti = QTreeWidgetItem([r.get("t", ""), bc.PROC_LEVEL_CN.get(r.get("level"), r.get("level") or ""),
+                                  r.get("name") or "", r.get("why") or "", r.get("path") or "",
+                                  r.get("action") or ""])
+            ti.setData(0, Qt.UserRole, r)
+            ti.setToolTip(3, r.get("why") or "")
+            ti.setToolTip(4, r.get("path") or "")
+            if r.get("sev") == "high" or r.get("action") == "已结束":
+                ti.setForeground(1, QBrush(QColor(sev_color("high"))))
+            elif r.get("sev") == "mid":
+                ti.setForeground(1, QBrush(QColor(sev_color("mid"))))
+            self.pw_tree.addTopLevelItem(ti)
+        self.tabs.setTabText(3, "新进程(%d)" % len(rows) if rows else "新进程")
+        self.btn_pw_vt.setEnabled(bool(rows))
+
+    @guard
+    def on_proc_opt(self, key, on):
+        if key == "auto_kill_adware" and on:
+            if QMessageBox.question(
+                    self, "自动结束流氓软件进程",
+                    "开启后，守护发现命中特征库的新程序会**直接结束它**，无法还原。\n\n"
+                    "· 特征库偶尔有误报：结束前会核对进程身份，系统进程和本程序自己永远不碰，但正常软件被误判时也会被结束\n"
+                    "· 只结束当前进程；它的自启项 / 服务还在的话，下次还会起来\n\n确定开启吗？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                self.chk_autokill.blockSignals(True)
+                self.chk_autokill.setChecked(False)
+                self.chk_autokill.blockSignals(False)
+                return
+        r = bc.load_popup_rules()
+        r[key] = bool(on)
+        bc.save_popup_rules(r)                   # 守护每次规则文件变了就重读，立即生效，不用重启
+
+    @guard
+    def on_pw_virustotal(self):
+        ti = self.pw_tree.currentItem()
+        r = (ti.data(0, Qt.UserRole) if ti else None) or {}
+        if r.get("path"):
+            sha = open_virustotal(self, r["path"])
+            if sha:
+                self.log.appendPlainText("已在浏览器打开 VirusTotal（只发送了哈希 %s…）：%s" % (sha[:12], r.get("name") or ""))
 
     def _fill_autostart(self):
         """守护记下的开机自启变化（新增 / 被重新启用 / 命令被改），最新在前。"""
@@ -1859,6 +1952,8 @@ class MainWindow(QMainWindow):
         self._sort_col = -1
         self._sort_desc = False
         self._stale = False          # 界面上显示的是不是上次的缓存结果（正在后台刷新）
+        self._auto_checks = bool(autoscan)   # 真实启动才做联网的自动检查；测试里（autoscan=False）不联网
+        self._db_auto_tried = False
         self.scan_worker = None
         self.fix_worker = None
         self.restore_worker = None
@@ -2975,6 +3070,7 @@ class MainWindow(QMainWindow):
             took = getattr(self, "_busy_elapsed", 0.0)
             self.lbl_status.setText("体检完成 %.1fs" % took if took else "体检完成")
             bc.save_last_scan(raw)
+            self._maybe_auto_update_db()
         self.bar.setValue(int(score or 0))
         self.bar.setStyleSheet("QProgressBar::chunk{background:%s;}" % gc)
         # 摘要要说清「勾了没有」：否则按钮是“智能优化（0）”，看着像坏了
@@ -4115,6 +4211,48 @@ class MainWindow(QMainWindow):
         self._dbw.sig_done.connect(self._on_db_updated)
         self._dbw.sig_fail.connect(self._on_db_failed)
         self._dbw.start()
+
+    def _maybe_auto_update_db(self, delay=1500):
+        """首次体检完成后，如果特征库超过 20 小时没检查，静默在后台更新一次。
+
+        只拉 3 个公开文本；没变化时不打扰、有更新时只在状态栏提一句；失败只记日志，不弹窗。
+        每次启动最多尝试一次；设置里可关。
+        """
+        if not self._auto_checks or self._db_auto_tried:
+            return
+        if not bc.get_setting("auto_update_db", True) or not bc.db_auto_due():
+            return
+        w = getattr(self, "_dbw", None)
+        if w is not None and w.isRunning():
+            return
+        self._db_auto_tried = True
+        QTimer.singleShot(delay, self._start_auto_db_update)
+
+    @guard
+    def _start_auto_db_update(self):
+        self._dbw = DbUpdateWorker(self)
+        self._dbw.sig_done.connect(self._on_db_auto_done)
+        self._dbw.sig_fail.connect(lambda txt: bc.log_line("特征库自动更新失败（本地库未改动）：%s" % (txt or "")[:300]))
+        self._dbw.start()
+
+    @guard
+    def _on_db_auto_done(self, rep):
+        if not rep or not rep.get("ok"):
+            bc.log_line("特征库自动更新失败（本地库未改动）：%s" % ((rep or {}).get("error") or "未知错误"))
+            return                                   # 失败不记「已检查」：下次启动再试
+        bc.set_setting("db_checked_at", time.time())
+        if rep.get("up_to_date"):
+            self.statusBar().showMessage("特征库已是最新（v%s）" % rep.get("version"), 5000)
+            return
+        self._sync_db_btn()
+        added = int(rep.get("added_dirs") or 0) + int(rep.get("added_pubs") or 0)
+        self.statusBar().showMessage(
+            "特征库已自动更新到 v%s：新增 %d 个目录 / %d 个签名主体" % (
+                rep.get("version"), rep.get("added_dirs") or 0, rep.get("added_pubs") or 0), 10000)
+        self._log("特征库自动更新：v%s，新增目录 %s、签名 %s；来源 %s" % (
+            rep.get("version"), rep.get("added_dirs"), rep.get("added_pubs"), rep.get("source")))
+        if added and not self._scan_busy():
+            self.start_scan()                        # 有新条目：用新库重新体检一遍（约 1 秒）
 
     def _on_db_failed(self, txt):
         self.statusBar().showMessage("特征库更新失败，本地库未改动", 8000)

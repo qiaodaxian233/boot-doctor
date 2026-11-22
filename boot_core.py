@@ -35,7 +35,7 @@ import urllib.request
 import winreg
 
 APP_NAME = "开机体检大师"
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 程序运行时产生的数据（备份 / 日志 / 设置 / 规则 / 快照）放哪里。默认就在程序目录；
@@ -71,6 +71,7 @@ FIX_DESC = {
     "startup_delete": "彻底删除自启项（删注册表值 / 启动文件夹快捷方式，原值或文件已备份）",
     "task_off": "禁用开机/登录触发的计划任务",
     "reg_edit": "修改浏览器 / 网络相关的注册表设置（原值已备份，可还原）",
+    "reg_key_delete": "删除别的软件在注册表里登记的浏览器扩展（整个键含全部值已备份，可还原）",
     "defender_pua": "开启 Windows Defender 的「潜在有害应用拦截」（拦截下载器 / 捆绑推广软件，原设置已备份）",
     "proc_kill": "结束正在运行的流氓软件进程（只结束当前进程，无法还原；要根治请同时处理它的自启项 / 卸载）",
     "hosts_clean": "从 hosts 文件里删掉被劫持的行（整个文件已备份，可还原）",
@@ -672,8 +673,10 @@ def diff_snapshot(old, new):
 # 卸载交给系统自身的 uninstall 注册表项，这里只把卸载命令找出来。
 # --------------------------------------------------------------------------
 
-ADWARE_DB_PATH = os.path.join(BASE_DIR, "adware_db.json")
+ADWARE_DB_PATH = os.environ.get("BOOTDOC_ADWARE_DB") or os.path.join(BASE_DIR, "adware_db.json")
 _ADB = {}
+_ADB_MTIME = [0.0]          # 加载时特征库文件的修改时间：长期运行的守护进程靠它发现库被更新了
+DB_AUTO_HOURS = 20          # 自动更新的最小间隔（小时）
 
 
 def adware_db():
@@ -743,7 +746,34 @@ def adware_db():
     d["_white"] = {str(w).strip("\\").strip().lower()
                    for w in (d.get("white") or []) if str(w).strip()}
     _ADB.update(d)
+    try:
+        _ADB_MTIME[0] = os.path.getmtime(ADWARE_DB_PATH)
+    except OSError:
+        _ADB_MTIME[0] = 0.0
     return _ADB
+
+
+def adware_db_reload_if_changed():
+    """特征库文件在磁盘上变了（别的进程更新了它）就丢掉内存里的副本，下次使用时重新加载。
+
+    守护进程是长期运行的：不做这一步，主程序自动更新了特征库，守护还在用启动时加载的旧库。
+    没加载过 / 没变化时只是一次 stat。返回是否触发了重新加载。
+    """
+    try:
+        mt = os.path.getmtime(ADWARE_DB_PATH)
+    except OSError:
+        return False
+    if _ADB and _ADB_MTIME[0] and mt != _ADB_MTIME[0]:
+        _ADB.clear()
+        return True
+    return False
+
+
+def db_auto_due(now=None, last=None, hours=None):
+    """距离上次成功检查特征库是否已经过了足够久（默认 20 小时）。"""
+    now = time.time() if now is None else now
+    last = float(get_setting("db_checked_at", 0) or 0) if last is None else float(last or 0)
+    return now - last >= (DB_AUTO_HOURS if hours is None else hours) * 3600
 
 
 def adware_db_stats():
@@ -1759,6 +1789,9 @@ DEFAULT_POPUP_RULES = {
     "auto_adware": True,      # 自动关闭命中流氓软件特征库的弹窗
     "poll_ms": 1200,
     "watch_autostart": True,  # 守护顺带盯开机自启的新增 / 重新启用 / 命令被改
+    "watch_process": True,    # 守护顺带盯新启动的程序：命中特征库 / 冒充微软时提醒
+    "auto_kill_adware": False,  # 命中特征库的新进程自动结束（默认关：结束进程是有破坏性的操作）
+    "watch_strict": False,    # 严格模式：未签名且从 Temp / AppData 启动的也提醒
     "block": [],              # [{"kind": "proc|path|title|class", "pattern": "...", "note": ""}]
     "allow": [],
 }
@@ -1771,7 +1804,8 @@ def load_popup_rules(path=None):
         with open(p, "r", encoding="utf-8") as fp:
             raw = json.load(fp)
         if isinstance(raw, dict):
-            for k in ("enabled", "auto_adware", "poll_ms", "watch_autostart"):
+            for k in ("enabled", "auto_adware", "poll_ms", "watch_autostart",
+                      "watch_process", "auto_kill_adware", "watch_strict"):
                 if k in raw:
                     d[k] = raw[k]
             for k in ("block", "allow"):
@@ -3004,10 +3038,74 @@ def analyze_shortcut(e):
     return None
 
 
+# 别的软件给浏览器「外部安装」扩展的注册表入口：浏览器启动时会按这里的清单装 / 更新扩展。
+# 正规软件（Adobe、杀软…）也用，但捆绑软件最爱用它悄悄塞扩展：改主页、注入广告、读浏览记录
+_EXT_ROOTS = (
+    ("Chrome", "HKLM", r"SOFTWARE\Google\Chrome\Extensions"),
+    ("Chrome", "HKLM", r"SOFTWARE\Wow6432Node\Google\Chrome\Extensions"),
+    ("Chrome", "HKCU", r"SOFTWARE\Google\Chrome\Extensions"),
+    ("Edge", "HKLM", r"SOFTWARE\Microsoft\Edge\Extensions"),
+    ("Edge", "HKLM", r"SOFTWARE\Wow6432Node\Microsoft\Edge\Extensions"),
+    ("Edge", "HKCU", r"SOFTWARE\Microsoft\Edge\Extensions"),
+)
+_EXT_ID_RE = re.compile(r"^[a-p]{32}$")
+_STORE_HOSTS = ("clients2.google.com", "clients2.googleusercontent.com", "chrome.google.com",
+                "edge.microsoft.com", "microsoftedge.microsoft.com")
+
+
+def read_external_extensions(roots=None):
+    """被别的程序通过注册表登记进浏览器的扩展：[{browser, hive, subkey, ext_id, update_url, path, version}]。"""
+    out = []
+    for browser, hive, base in (roots if roots is not None else _EXT_ROOTS):
+        root = _root_of(hive)
+        try:
+            with winreg.OpenKey(root, base, 0, winreg.KEY_READ) as k:
+                ids = [winreg.EnumKey(k, i) for i in range(winreg.QueryInfoKey(k)[0])]
+        except OSError:
+            continue
+        for eid in ids:
+            if not _EXT_ID_RE.match(eid):
+                continue
+            sub = base + "\\" + eid
+            out.append({"browser": browser, "hive": hive, "subkey": sub, "ext_id": eid,
+                        "update_url": _reg_str(root, sub, "update_url"),
+                        "path": _reg_str(root, sub, "path"),
+                        "version": _reg_str(root, sub, "version")})
+    return out
+
+
+def analyze_extension(e):
+    """判断一个外部登记的扩展。返回 {sev, store, why}：
+
+      来自官方商店（只是被别的程序登记）           → info
+      更新地址不是官方商店 / 本地 .crx 文件         → mid
+      明文 http / IP 地址 / 导航站 / 文件在 Temp 等  → high
+    """
+    url, path = (e.get("update_url") or "").strip(), (e.get("path") or "").strip()
+    host = _host_of(url)
+    if url:
+        if _dom_match(host, _STORE_HOSTS):
+            return {"sev": "info", "store": True,
+                    "why": "更新地址是官方商店（%s）：扩展本身来自商店，只是被别的程序登记进来的" % host}
+        bad = (url.lower().startswith("http://") or re.match(r"^\d+\.\d+\.\d+\.\d+$", host or "")
+               or is_nav_host(host))
+        return {"sev": "high" if bad else "mid", "store": False,
+                "why": "更新地址不是官方商店：%s%s" % (url[:90],
+                                                  "（明文 HTTP / IP 地址 / 导航站，更可疑）" if bad else "")}
+    if path:
+        gone = not os.path.isfile(os.path.expandvars(path))
+        if gone:
+            return {"sev": "low", "store": False, "why": "登记的 .crx 文件已经不在了：%s" % path[:90]}
+        sev = "high" if _in_user_dropzone(path) else "mid"
+        return {"sev": sev, "store": False,
+                "why": "从本地 .crx 文件安装：%s%s" % (path[:90], "（位于 Temp / AppData 一类位置）" if sev == "high" else "")}
+    return {"sev": "low", "store": False, "why": "登记了扩展 ID，但没有更新地址也没有文件路径"}
+
+
 def collect_hijack():
     """采集浏览器劫持相关的现状（只读，各项独立兜底，任何一项失败都不影响别的）。"""
     d = {"managed": False, "proxy": {}, "listeners": [], "policies": [], "ie": [],
-         "hosts": {}, "lnks": []}
+         "hosts": {}, "lnks": [], "extensions": []}
 
     def safe(key, fn, default):
         try:
@@ -3027,6 +3125,7 @@ def collect_hijack():
     safe("ie", read_ie_pages, [])
     safe("hosts", read_hosts, {})
     safe("lnks", scan_browser_shortcuts, [])
+    safe("extensions", read_external_extensions, [])
     return d
 
 
@@ -3251,10 +3350,50 @@ def _security_findings(sysd, add):
                         "或网络里屏蔽了微软的更新域名（体检的「浏览器劫持」会检查 hosts）。"))
 
 
+def _ext_findings(d, add):
+    """被别的程序通过注册表登记的浏览器扩展：按浏览器合并成一条。商店来源的只提示，其余可清除。"""
+    rows = d.get("extensions") or []
+    if not rows:
+        return
+    managed = bool(d.get("managed"))
+    by = {}
+    for e in rows:
+        by.setdefault(e["browser"], []).append(dict(e, **analyze_extension(e)))
+    order = {"high": 0, "mid": 1, "low": 2, "info": 3}
+    for browser, items in by.items():
+        items.sort(key=lambda x: order.get(x["sev"], 9))
+        worst = items[0]["sev"]
+        sus = [x for x in items if not x["store"]]
+        sev = "info" if managed else worst
+        lines = []
+        for x in items[:12]:
+            lines.append("· %s  [%s]" % (x["ext_id"], x["hive"]))
+            lines.append("    %s" % x["why"])
+            if x["store"] or not x.get("path"):
+                lines.append("    商店页面：https://chromewebstore.google.com/detail/%s" % x["ext_id"]
+                             if browser == "Chrome" else
+                             "    商店页面：https://microsoftedge.microsoft.com/addons/detail/%s" % x["ext_id"])
+        fix = None
+        if sus and not managed:
+            fix = {"type": "reg_key_delete", "risk": "confirm",
+                   "items": [{"hive": x["hive"], "subkey": x["subkey"]} for x in sus]}
+        add(id="hij_ext@" + browser, cat="浏览器劫持", sev=sev,
+            title="%s 有 %d 个扩展是被别的程序通过注册表装进来的" % (browser, len(items)),
+            short=("有 %d 个来源不明" % len(sus)) if sus else "都来自官方商店",
+            detail=("这些扩展不是你在浏览器里点「添加」装的，而是某个程序在注册表里登记，浏览器启动时照单安装 / 更新：\n\n%s\n\n"
+                    "正规软件（Adobe、杀软）也会这样做；但捆绑的推广软件最爱用它悄悄塞扩展——改主页、注入广告、读浏览记录。\n"
+                    "%s") % ("\n".join(lines),
+                            "这台电脑是单位管理的，多半是管理员部署的，不建议动。" if managed else
+                            ("处理：清除来源不明的登记项（整个键已备份，可还原）。清除后浏览器通常会在下次启动时把对应扩展一并移除；"
+                             "商店来源的只提示，不动。")),
+            fix=fix, default=False)
+
+
 def _hijack_findings(d, add):
     if not d:
         return
-    for fn in (_proxy_findings, _policy_findings, _ie_findings, _hosts_findings, _lnk_findings):
+    for fn in (_proxy_findings, _policy_findings, _ie_findings, _hosts_findings, _lnk_findings,
+               _ext_findings):
         try:
             fn(d, add)
         except Exception as e:
@@ -3330,6 +3469,87 @@ def enum_processes():
     finally:
         k32.CloseHandle(snap)
     return out
+
+
+PROC_WATCH_LOG = os.path.join(LOG_DIR, "process_watch.log")
+PROC_LEVEL_CN = {"adware": "命中特征库", "spoof": "冒充微软", "unsigned": "未签名（严格模式）"}
+
+
+def _in_user_dropzone(path):
+    """恶意 / 推广程序最爱待的位置：Temp、AppData、ProgramData、Public（不含 Downloads：用户自己下的程序太多）。"""
+    p = (path or "").lower().replace("/", "\\")
+    pd = (os.environ.get("ProgramData") or r"C:\ProgramData").lower().rstrip("\\") + "\\"
+    pub = (os.environ.get("PUBLIC") or r"C:\Users\Public").lower().rstrip("\\") + "\\"
+    return ("\\appdata\\" in p or "\\temp\\" in p or "\\tmp\\" in p
+            or p.startswith(pd) or p.startswith(pub))
+
+
+def judge_new_process(p, strict=False):
+    """判断一个新启动的进程要不要提醒。返回 {level, sev, label, why, ...}，没问题返回 None。
+
+    默认只报高把握的两类，避免天天弹提醒：
+      adware  命中流氓软件特征库（目录名 / 签名主体 / 家族规则，含签名核实）
+      spoof   公司名写 Microsoft、签名却不是微软
+    strict=True 再加一类：没有任何签名、且从 Temp / AppData / ProgramData 启动的
+    （很多安装程序会把自己解压到 Temp 运行，所以默认关）。
+    """
+    path, name = p.get("path") or "", p.get("name") or os.path.basename(p.get("path") or "")
+    if not path or _under_system_dir(path):
+        return None
+    base = {"pid": p.get("pid"), "ctime": p.get("ctime") or 0, "name": name, "path": path,
+            "company": p.get("company") or ""}
+    r = adware_check(path=path, name=name, company=p.get("company") or "", cmd=path)
+    if r.get("hit"):
+        return dict(base, level="adware", sev=r.get("sev", "mid"), label=r.get("label", ""),
+                    why=r.get("why", ""), family=r.get("family", ""), spoof=bool(r.get("spoof")))
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    app = {"path": path, "exists": True, "size": int(st.st_size), "mtime": int(st.st_mtime),
+           "company": p.get("company") or ""}
+    v = ms_spoof_verdict(app)
+    if v:
+        return dict(base, level="spoof", sev=v[0], label="疑似冒充微软", why=v[1], family="")
+    if strict and _in_user_dropzone(path) and app_signature(app).get("state") == "unsigned":
+        return dict(base, level="unsigned", sev="low", label="未签名程序",
+                    why="没有任何数字签名，且从 Temp / AppData / ProgramData 一类位置启动", family="")
+    return None
+
+
+def append_proc_watch(rows, path=None):
+    if not rows:
+        return
+    p = path or PROC_WATCH_LOG
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "a", encoding="utf-8") as fp:
+            for r in rows:
+                fp.write(json.dumps(r, ensure_ascii=False) + "\n")
+        if os.path.getsize(p) > 512 * 1024:
+            with open(p, "r", encoding="utf-8", errors="replace") as fp:
+                lines = fp.readlines()[-800:]
+            with open(p, "w", encoding="utf-8") as fp:
+                fp.writelines(lines)
+    except Exception as e:
+        log_line("append proc watch failed: %r" % (e,))
+
+
+def proc_watch_log(limit=200, path=None):
+    """新进程提醒记录，最新在前。"""
+    out = []
+    try:
+        with open(path or PROC_WATCH_LOG, "r", encoding="utf-8", errors="replace") as fp:
+            for line in fp:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except Exception:
+                        pass
+    except Exception:
+        return []
+    return out[-int(limit):][::-1]
 
 
 def proc_kill_allowed(name, path, pid=0):
@@ -5380,8 +5600,19 @@ def _remove_delay_task(task_name, dry_run=False):
     return False, "删除任务失败：%s（可能已不存在）" % task_name
 
 
-def _ms_spoof_findings(F, add):
-    """公司名写着 Microsoft、数字签名却不是微软的文件：给一条体检项。
+_PROTECTED_ROOTS_CACHE = []
+
+
+def _protected_roots():
+    if not _PROTECTED_ROOTS_CACHE:
+        _PROTECTED_ROOTS_CACHE.append(tuple(x.lower().rstrip("\\") + "\\" for x in (
+            os.environ.get("SystemRoot", r"C:\Windows"), os.environ.get("ProgramFiles", ""),
+            os.environ.get("ProgramFiles(x86)", ""), os.environ.get("ProgramW6432", "")) if x))
+    return _PROTECTED_ROOTS_CACHE[0]
+
+
+def ms_spoof_verdict(app):
+    """公司名写着 Microsoft、数字签名却不是微软：返回 (sev, 说明)，没问题返回 None。
 
     只在证据确凿时报，宁可漏报也不吓用户：
       · 签名校验通过，但签名者是别人（名字不以 Microsoft 开头）  → 高危
@@ -5391,6 +5622,22 @@ def _ms_spoof_findings(F, add):
     系统目录里的文件不查「没签名」：老系统文件的目录签名有可能漏查，那里有系统文件保护，
     被替换要先拿到最高权限。
     """
+    path = (app or {}).get("path") or ""
+    if not path or not app.get("exists") or "microsoft" not in (app.get("company") or "").lower():
+        return None
+    sig = app_signature(app)
+    st, signer = sig.get("state"), (sig.get("signer") or "")
+    if st == "valid" and signer and not _ms_ish(signer):
+        return "high", "数字签名校验通过，但签名者是「%s」，不是微软" % signer
+    if st == "invalid" and sig.get("rc") in (_TRUST_E_BAD_DIGEST, _TRUST_E_EXPLICIT_DISTRUST):
+        return "high", "数字签名无效：%s" % (sig.get("detail") or "").split("\n")[0]
+    if st == "unsigned" and not path.lower().replace("/", "\\").startswith(_protected_roots()):
+        return "mid", "文件没有任何数字签名，而且放在系统目录和 Program Files 之外"
+    return None
+
+
+def _ms_spoof_findings(F, add):
+    """公司名写着 Microsoft、数字签名却不是微软的文件：给一条体检项（判定见 ms_spoof_verdict）。"""
     cands = {}
     for f in F:
         a = f.get("app") or {}
@@ -5399,21 +5646,11 @@ def _ms_spoof_findings(F, add):
     if not cands:
         return
     warm_signatures(list(cands.values()))
-    roots = tuple(x.lower().rstrip("\\") + "\\" for x in (
-        os.environ.get("SystemRoot", r"C:\Windows"), os.environ.get("ProgramFiles", ""),
-        os.environ.get("ProgramFiles(x86)", ""), os.environ.get("ProgramW6432", "")) if x)
     for key, a in cands.items():
-        sig = app_signature(a)
-        st, signer = sig.get("state"), (sig.get("signer") or "")
-        sev = why = ""
-        if st == "valid" and signer and not _ms_ish(signer):
-            sev, why = "high", "数字签名校验通过，但签名者是「%s」，不是微软" % signer
-        elif st == "invalid" and sig.get("rc") in (_TRUST_E_BAD_DIGEST, _TRUST_E_EXPLICIT_DISTRUST):
-            sev, why = "high", "数字签名无效：%s" % (sig.get("detail") or "").split("\n")[0]
-        elif st == "unsigned" and not key.replace("/", "\\").startswith(roots):
-            sev, why = "mid", "文件没有任何数字签名，而且放在系统目录和 Program Files 之外"
-        if not sev:
+        v = ms_spoof_verdict(a)
+        if not v:
             continue
+        sev, why = v
         name = a.get("desc") or os.path.basename(a["path"])
         add(id="ms_spoof@" + key, cat="流氓软件", sev=sev, name=name, src="冒充微软",
             title="疑似冒充微软组件：%s" % name,
@@ -6334,6 +6571,12 @@ def make_backup(findings, backup_root=None, tag=""):
                 snap["items"].append({"id": rid, "kind": "reg_edit", "hive": hv,
                                       "subkey": it["subkey"], "name": it["name"],
                                       "existed": val is not None, "value": val, "valuetype": typ})
+        elif t == "reg_key_delete":
+            for it in fx["items"]:
+                hv = it.get("hive", "HKCU")
+                snap["items"].append({"id": rid, "kind": "reg_key", "hive": hv, "subkey": it["subkey"],
+                                      "name": it["subkey"].rsplit("\\", 1)[-1],
+                                      "dump": _dump_key_tree(_root_of(hv), it["subkey"])})
         elif t == "defender_pua":
             snap["items"].append({"id": rid, "kind": "defender_pua", "name": "PUAProtection",
                                   "old": _read_pua()})
@@ -6412,6 +6655,7 @@ def make_backup_readme_text(snap):
         "rm_svc": "被删除的服务键", "task": "被禁用的计划任务",
         "delay_task_del": "被删除的计划任务",
         "hosts": "hosts 文件", "lnk_args": "被改过参数的快捷方式",
+        "reg_key": "被删除的浏览器扩展注册项",
     }
     reg_has = [v for k, v in reg_only.items() if k in kinds]
     need = [v for k, v in app_only.items() if k in kinds]
@@ -6628,6 +6872,50 @@ def _set_lnk_args(path, new_args, dry_run=False):
     if (info.get("args") or "") != (new_args or ""):
         return False, "改写后校验不一致：%s（参数现为 %r）" % (path, info.get("args"))
     return True, "已清掉快捷方式里多余的网址：%s" % path
+
+
+def _dump_key_tree(root, sub):
+    """把一个注册表键（含全部值和子键）导成可存 JSON 的结构；键不存在返回 None。"""
+    try:
+        k = winreg.OpenKey(root, sub, 0, winreg.KEY_READ)
+    except OSError:
+        return None
+    vals, subs = [], {}
+    with k:
+        n_sub, n_val, _t = winreg.QueryInfoKey(k)
+        for i in range(n_val):
+            vn, vd, vt = winreg.EnumValue(k, i)
+            if isinstance(vd, bytes):
+                vd = {"__b64__": base64.b64encode(vd).decode("ascii")}
+            vals.append([str(vn), int(vt), vd])
+        names = [winreg.EnumKey(k, i) for i in range(n_sub)]
+    for c in names:
+        subs[c] = _dump_key_tree(root, sub + "\\" + c)
+    return {"values": vals, "subkeys": subs}
+
+
+def _restore_key_tree(root, sub, dump):
+    with winreg.CreateKeyEx(root, sub, 0, winreg.KEY_SET_VALUE) as k:
+        for vn, vt, vd in dump.get("values") or []:
+            if isinstance(vd, dict) and "__b64__" in vd:
+                vd = base64.b64decode(vd["__b64__"])
+            winreg.SetValueEx(k, vn, 0, int(vt), vd)
+    for c, d in (dump.get("subkeys") or {}).items():
+        if d is not None:
+            _restore_key_tree(root, sub + "\\" + c, d)
+
+
+def _reg_key_delete_apply(it, dry_run=False):
+    desc = "%s\\%s" % (it.get("hive", "HKCU"), it.get("subkey", ""))
+    if dry_run:
+        return True, "[试运行] 删除注册表键：%s" % desc
+    try:
+        _delete_key_tree(_root_of(it.get("hive", "HKCU")), it["subkey"])
+        return True, "已删除：%s" % desc
+    except FileNotFoundError:
+        return True, "本来就不存在：%s" % desc
+    except OSError as e:
+        return False, "删除失败：%s（%s）" % (desc, e)
 
 
 def _read_pua():
@@ -6980,6 +7268,11 @@ def apply_fixes(findings, backup_dir, progress=None, dry_run=False):
                     ok, msg = _reg_edit_apply(it, dry_run)
                     res["msgs"].append(msg)
                     res["ok"] = res["ok"] and ok
+            elif t == "reg_key_delete":
+                for it in fx["items"]:
+                    ok, msg = _reg_key_delete_apply(it, dry_run)
+                    res["msgs"].append(msg)
+                    res["ok"] = res["ok"] and ok
             elif t == "defender_pua":
                 for it in fx["items"]:
                     ok, msg = _set_pua(it.get("value", 1), dry_run)
@@ -7169,6 +7462,19 @@ def restore_backup(backup_dir, progress=None, dry_run=False):
                 ok, msg = _reg_edit_restore(it, dry_run)
                 res["ok"] = ok
                 res["msgs"].append(msg)
+            elif k == "reg_key":
+                desc = "%s\\%s" % (it.get("hive"), it.get("subkey"))
+                if dry_run:
+                    res["msgs"].append("[试运行] 还原注册表键：%s" % desc)
+                elif it.get("dump") is None:
+                    res["msgs"].append("（备份时这个键就不存在，无需还原）：%s" % desc)
+                else:
+                    try:
+                        _restore_key_tree(_root_of(it.get("hive", "HKCU")), it["subkey"], it["dump"])
+                        res["msgs"].append("已还原：%s" % desc)
+                    except OSError as e:
+                        res["ok"] = False
+                        res["msgs"].append("还原失败：%s（%s）" % (desc, e))
             elif k == "defender_pua":
                 if it.get("old") is None:
                     res["msgs"].append("（快照里没有原值，请到 Windows 安全中心手动确认）")

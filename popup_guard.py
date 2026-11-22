@@ -185,6 +185,15 @@ class Guard(QApplication):
             # 拦截先开始工作；自启监控要拍快照、挂一批变更通知，稍后再启动，别拖慢「开始拦截」
             QTimer.singleShot(400, self.start_autostart_watch)
 
+        # 新进程提醒：每 1.5 秒对比一次进程列表（枚举 17 个进程约 10ms，几乎不占 CPU）
+        self.proc_seen = {}         # (pid, ctime) -> 首次见到的时间
+        self.proc_alerted = {}      # 路径 -> 上次提醒时间（同一个程序 10 分钟内只提醒一次，防刷屏）
+        self.proc_baseline = False
+        self.proc_alerts = 0
+        self.proc_timer = QTimer(self)
+        self.proc_timer.timeout.connect(self.check_processes)
+        QTimer.singleShot(600, lambda: self.proc_timer.start(1500))
+
         self.update_tip()
         glog("守护启动 pid=%d 管理员=%s 事件钩子=%s 规则 block=%d allow=%d auto=%s"
              % (os.getpid(), bc.is_admin(), "on" if self._hook else "off(轮询)",
@@ -272,6 +281,76 @@ class Guard(QApplication):
                              cwd=HERE, creationflags=0x08000000)
         except Exception as e:
             glog("打开主程序失败：%r" % (e,))
+
+    # ---------------- 新进程提醒 ----------------
+    def check_processes(self):
+        """对比进程列表：第一次只建基线（守护启动前就在跑的不报），之后出现的新进程逐个判定。"""
+        self.reload_rules()          # 开关改了立即生效：规则文件没变时只是一次 stat，几乎没有开销
+        if bc.adware_db_reload_if_changed():     # 主程序自动更新了特征库：守护不用重启就用上新库
+            glog("特征库文件已更新，已重新加载")
+        if self.paused or not self.rules.get("watch_process", True):
+            return
+        try:
+            procs = bc.enum_processes()
+        except Exception as e:
+            glog("枚举进程失败：%r" % (e,))
+            return
+        now = time.time()
+        alive = {(p["pid"], p["ctime"]) for p in procs}
+        if not self.proc_baseline:
+            self.proc_seen = {k: now for k in alive}
+            self.proc_baseline = True
+            glog("新进程监控已启动，基线 %d 个进程（之前就在运行的不提醒）" % len(alive))
+            return
+        strict = bool(self.rules.get("watch_strict"))
+        rows = []
+        for p in procs:
+            key = (p["pid"], p["ctime"])
+            if key in self.proc_seen:
+                continue
+            self.proc_seen[key] = now
+            try:
+                v = bc.judge_new_process(p, strict=strict)
+            except Exception as e:
+                glog("判定进程失败 %s：%r" % (p.get("name"), e))
+                continue
+            if v:
+                rows.append(self.handle_new_process(v, now))
+        self.proc_seen = {k: t for k, t in self.proc_seen.items() if k in alive}   # 只留还活着的
+        for pth in [k for k, t in self.proc_alerted.items() if now - t > 3600]:
+            self.proc_alerted.pop(pth, None)
+        rows = [r for r in rows if r]
+        if rows:
+            bc.append_proc_watch(rows)
+
+    def handle_new_process(self, v, now):
+        """一个新进程命中了：记日志，必要时自动结束，托盘提醒。返回要写进记录的行。"""
+        path = v["path"]
+        action = "提醒"
+        if (v["level"] == "adware" and self.rules.get("auto_kill_adware")
+                and bc.proc_kill_allowed(v["name"], path, int(v["pid"]))):
+            ok, msg = bc.kill_process(int(v["pid"]), int(v["ctime"]), path)
+            action = "已结束" if ok and "已结束" in msg else "结束失败"
+            glog("新进程「%s」命中特征库，自动结束：%s" % (v["name"], msg))
+        else:
+            glog("新进程「%s」%s：%s  %s" % (v["name"], bc.PROC_LEVEL_CN.get(v["level"], v["level"]),
+                                          v["why"], path))
+        row = {"t": time.strftime("%Y-%m-%d %H:%M:%S"), "level": v["level"], "sev": v["sev"],
+               "label": v.get("label") or "", "name": v["name"], "path": path, "why": v["why"],
+               "action": action}
+        self.proc_alerts += 1
+        if now - self.proc_alerted.get(path.lower(), 0) > 600:      # 同一个程序 10 分钟内只弹一次
+            self.proc_alerted[path.lower()] = now
+            title = "新启动的程序：%s" % v["name"]
+            if action == "已结束":
+                title = "已结束流氓软件进程：%s" % v["name"]
+            msg = "%s\n%s\n%s\n点这里查看" % (v.get("label") or bc.PROC_LEVEL_CN.get(v["level"], ""),
+                                            v["why"][:80], path[-70:])
+            try:
+                self.tray.showMessage(title, msg, QSystemTrayIcon.Warning, 10000)
+            except Exception:
+                pass
+        return row
 
     # ---------------- 事件钩子 ----------------
     def install_hook(self):
@@ -425,6 +504,8 @@ class Guard(QApplication):
         if self.paused and not force:
             return
         self.reload_rules()                  # 规则可能被主程序改过
+        if bc.adware_db_reload_if_changed():
+            glog("特征库文件已更新，已重新加载")
         want = self.poll_interval()
         if self.timer.interval() != want:
             self.timer.setInterval(want)
