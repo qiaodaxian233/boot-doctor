@@ -31,7 +31,7 @@ from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPixmap  # noqa: E402
 from PyQt5.QtWidgets import (QAction, QApplication, QMenu, QMessageBox,  # noqa: E402
                              QSystemTrayIcon)
 
-GL = os.path.join(HERE, "_logs", "popup_guard.log")
+GL = os.path.join(bc.LOG_DIR, "popup_guard.log")
 WM_CLOSE = 0x0010
 ERROR_ACCESS_DENIED = 5
 ERROR_ALREADY_EXISTS = 183

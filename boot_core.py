@@ -37,9 +37,14 @@ APP_NAME = "开机体检大师"
 VERSION = "1.9.2"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-BACKUP_DIR = os.path.join(BASE_DIR, "_backups")
-LOG_DIR = os.path.join(BASE_DIR, "_logs")
-SETTINGS_PATH = os.path.join(BASE_DIR, "_settings.json")
+# 程序运行时产生的数据（备份 / 日志 / 设置 / 规则 / 快照）放哪里。默认就在程序目录；
+# 设了 BOOTDOC_DATA_DIR 就改放到那里——装在 Program Files 之类不能写的位置时需要，
+# 自动测试也靠它把守护进程的数据隔离到临时目录，不碰真实数据。
+# 特征库 adware_db.json 和守护脚本属于程序本身，不跟着挪。
+DATA_DIR = os.environ.get("BOOTDOC_DATA_DIR") or BASE_DIR
+BACKUP_DIR = os.path.join(DATA_DIR, "_backups")
+LOG_DIR = os.path.join(DATA_DIR, "_logs")
+SETTINGS_PATH = os.path.join(DATA_DIR, "_settings.json")
 
 SEV_CN = {"high": "高", "mid": "中", "low": "低", "info": "提示"}
 SEV_ORDER = {"high": 0, "mid": 1, "low": 2, "info": 3}
@@ -528,7 +533,7 @@ def enum_extra_autostarts():
 # 采集 1c：启动项快照（用于「装完软件多了什么」对比）
 # --------------------------------------------------------------------------
 
-SNAPSHOT_DIR = os.path.join(BASE_DIR, "_snapshots")
+SNAPSHOT_DIR = os.path.join(DATA_DIR, "_snapshots")
 
 
 def snapshot_path(ts=None):
@@ -1466,7 +1471,7 @@ def adware_summary(res):
 
 _W = ctypes.windll.user32
 _K = ctypes.windll.kernel32
-POPUP_RULES_PATH = os.path.join(BASE_DIR, "_popup_rules.json")
+POPUP_RULES_PATH = os.path.join(DATA_DIR, "_popup_rules.json")
 GUARD_PID_PATH = os.path.join(LOG_DIR, "popup_guard.pid")
 GUARD_STOP_PATH = os.path.join(LOG_DIR, "popup_guard.stop")
 GUARD_SCRIPT = os.path.join(BASE_DIR, "popup_guard.py")

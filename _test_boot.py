@@ -2265,5 +2265,254 @@ class TestBrowserHijack(unittest.TestCase):
             win.close()
 
 
+class _TestWindow(object):
+    """在测试进程里开一个真的顶层窗口（独立线程 + 消息循环），用来喂给守护进程。
+
+    窗口过程直接用 DefWindowProcW：收到 WM_CLOSE 默认就会 DestroyWindow，
+    所以「守护发了 WM_CLOSE」的效果能从 IsWindow 直接看出来。
+    """
+    _n = 0
+
+    def __init__(self, title, cls=None):
+        import threading
+        _TestWindow._n += 1
+        self.title = title
+        self.cls = cls or "BDE2EClass%d" % _TestWindow._n
+        self.hwnd = 0
+        self.tid = 0
+        self.shown_at = 0.0
+        self._ready = threading.Event()
+        self._u = ctypes.WinDLL("user32", use_last_error=True)
+        self._t = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        import ctypes.wintypes as wt
+        u = self._u
+        k = ctypes.WinDLL("kernel32")
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [("style", wt.UINT), ("lpfnWndProc", ctypes.c_void_p),
+                        ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                        ("hInstance", wt.HANDLE), ("hIcon", wt.HANDLE), ("hCursor", wt.HANDLE),
+                        ("hbrBackground", wt.HANDLE), ("lpszMenuName", wt.LPCWSTR),
+                        ("lpszClassName", wt.LPCWSTR)]
+        u.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        u.CreateWindowExW.restype = wt.HWND
+        u.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.HWND, wt.HANDLE,
+                                      wt.HANDLE, ctypes.c_void_p]
+        u.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+        u.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT]
+        k.GetModuleHandleW.restype = wt.HANDLE
+        k.GetModuleHandleW.argtypes = [wt.LPCWSTR]
+        hinst = k.GetModuleHandleW(None)
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = ctypes.cast(u.DefWindowProcW, ctypes.c_void_p).value
+        wc.hInstance = hinst
+        wc.lpszClassName = self.cls
+        u.RegisterClassW(ctypes.byref(wc))
+        # 先建成隐藏的，再显式 ShowWindow：这样「窗口显示」事件是确定会发出的，量到的是钩子延迟
+        self.hwnd = u.CreateWindowExW(0x8, self.cls, self.title, 0x00CF0000, 120, 120, 320, 200,
+                                      None, None, hinst, None)
+        self.tid = k.GetCurrentThreadId()
+        self._ready.set()
+        msg = wt.MSG()
+        while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            u.TranslateMessage(ctypes.byref(msg))
+            u.DispatchMessageW(ctypes.byref(msg))
+
+    def start(self):
+        self._t.start()
+        assert self._ready.wait(10) and self.hwnd, "窗口没建出来：%s" % ctypes.get_last_error()
+        return self
+
+    def show(self):
+        import time as _t
+        self.shown_at = _t.perf_counter()
+        self._u.ShowWindow(self.hwnd, 5)
+
+    def alive(self):
+        return bool(self._u.IsWindow(self.hwnd))
+
+    def wait_closed(self, timeout):
+        """等窗口被销毁，返回从 show() 起经过的秒数；超时返回 None。"""
+        import time as _t
+        end = _t.perf_counter() + timeout
+        while _t.perf_counter() < end:
+            if not self.alive():
+                return _t.perf_counter() - self.shown_at
+            _t.sleep(0.02)
+        return None
+
+    def stop(self):
+        try:
+            if self.alive():
+                self._u.SendMessageTimeoutW(self.hwnd, 0x0010, 0, 0, 2, 500, None)   # WM_CLOSE
+            self._u.PostThreadMessageW(self.tid, 0x0012, 0, 0)                       # WM_QUIT
+        except Exception:
+            pass
+
+
+class TestGuardE2E(unittest.TestCase):
+    """真正的 popup_guard.py 进程：事件钩子、规则热加载、系统窗口豁免、新增自启提醒、停止。
+
+    以前「守护」只有一个替身脚本的测试，真正的守护进程从没在 Windows 上跑过。
+    数据（规则 / 日志 / pid）通过 BOOTDOC_DATA_DIR 隔离到临时目录。
+    """
+    PROBE = "BootDoctorE2EProbe"
+    RUN = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+    @classmethod
+    def setUpClass(cls):
+        import time as _t
+        cls.td = tempfile.mkdtemp(prefix="bd_e2e_")
+        cls._env = os.environ.get("BOOTDOC_DATA_DIR")
+        os.environ["BOOTDOC_DATA_DIR"] = cls.td                  # 子进程继承
+        cls._saved = {k: getattr(bc, k) for k in ("DATA_DIR", "LOG_DIR", "POPUP_RULES_PATH",
+                                                    "GUARD_PID_PATH", "GUARD_STOP_PATH",
+                                                    "AUTOSTART_BASELINE", "AUTOSTART_WATCH_LOG")}
+        bc.DATA_DIR = cls.td
+        bc.LOG_DIR = os.path.join(cls.td, "_logs")
+        bc.POPUP_RULES_PATH = os.path.join(cls.td, "_popup_rules.json")
+        bc.GUARD_PID_PATH = os.path.join(bc.LOG_DIR, "popup_guard.pid")
+        bc.GUARD_STOP_PATH = os.path.join(bc.LOG_DIR, "popup_guard.stop")
+        bc.AUTOSTART_BASELINE = os.path.join(bc.LOG_DIR, "autostart_baseline.json")
+        bc.AUTOSTART_WATCH_LOG = os.path.join(bc.LOG_DIR, "autostart_watch.log")
+        os.makedirs(bc.LOG_DIR, exist_ok=True)
+        cls.rules = {"enabled": True, "auto_adware": False, "poll_ms": 1200, "watch_autostart": True,
+                     "block": [{"kind": "title", "pattern": "BootDoctorE2EPopup", "note": "e2e"}],
+                     "allow": []}
+        assert bc.save_popup_rules(cls.rules)
+        cls._qpa = os.environ.pop("QT_QPA_PLATFORM", None)        # 守护按真实平台跑，不是离屏
+        cls.windows = []
+        try:
+            ok, msg = bc.start_popup_guard()
+        finally:
+            if cls._qpa is not None:
+                os.environ["QT_QPA_PLATFORM"] = cls._qpa
+        assert ok, "守护没起来：%s\n%s" % (msg, cls.log())
+        for _ in range(100):                                       # 等它把「启动」写进日志
+            if "守护启动" in cls.log():
+                break
+            _t.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        for w in cls.windows:
+            w.stop()
+        try:
+            bc.stop_popup_guard()
+        finally:
+            pid = bc.guard_pid()
+            if pid:
+                h = ctypes.windll.kernel32.OpenProcess(0x0001, False, pid)
+                if h:
+                    ctypes.windll.kernel32.TerminateProcess(h, 0)
+                    ctypes.windll.kernel32.CloseHandle(h)
+            for k, v in cls._saved.items():
+                setattr(bc, k, v)
+            if cls._env is None:
+                os.environ.pop("BOOTDOC_DATA_DIR", None)
+            else:
+                os.environ["BOOTDOC_DATA_DIR"] = cls._env
+            shutil.rmtree(cls.td, ignore_errors=True)
+
+    @classmethod
+    def log(cls):
+        try:
+            with open(os.path.join(cls.td, "_logs", "popup_guard.log"), encoding="utf-8") as fp:
+                return fp.read()
+        except OSError:
+            return ""
+
+    def _win(self, title, cls=None):
+        w = _TestWindow(title, cls).start()
+        self.windows.append(w)
+        return w
+
+    def test_a_guard_is_running_with_hook(self):
+        self.assertTrue(bc.guard_running())
+        log = self.log()
+        self.assertIn("事件钩子=on", log, "事件钩子没装上，守护退回了纯轮询：\n" + log)
+        self.assertIn("自启监控已启动", log, "自启监控没起来：\n" + log)
+
+    def test_b_matching_window_closed_by_event_hook(self):
+        """轮询兜底是 5 秒一次：2.5 秒内被关掉，只能是事件钩子起的作用。"""
+        w = self._win("BootDoctorE2EPopup 限时特惠")
+        w.show()
+        took = w.wait_closed(8)
+        print("  事件钩子关窗耗时 %s" % ("%.2fs" % took if took is not None else "超时"))
+        self.assertIsNotNone(took, "窗口一直没被关掉。日志：\n" + self.log())
+        self.assertLess(took, 2.5, "关得太慢，像是靠轮询而不是事件钩子（%.2fs）" % took)
+        self.assertIn("拦截「BootDoctorE2EPopup", self.log())
+
+    def test_c_non_matching_window_left_alone(self):
+        import time as _t
+        w = self._win("BootDoctorE2EInnocent")
+        w.show()
+        _t.sleep(2.5)
+        self.assertTrue(w.alive(), "没命中规则的窗口被关了")
+
+    def test_d_system_window_class_never_closed(self):
+        """规则命中了，但窗口类是系统外壳的（WorkerW）：必须放过。"""
+        import time as _t
+        w = self._win("BootDoctorE2EPopup but system class", cls="WorkerW")
+        w.show()
+        _t.sleep(3)
+        self.assertTrue(w.alive(), "系统窗口类被关了")
+
+    def test_e_rules_reload_without_restart(self):
+        import time as _t
+        w = self._win("BootDoctorE2ENewRule")
+        w.show()
+        _t.sleep(1.5)
+        self.assertTrue(w.alive(), "规则还没加，不该被关")
+        rules = dict(self.rules)
+        rules["block"] = list(self.rules["block"]) + [
+            {"kind": "title", "pattern": "BootDoctorE2ENewRule", "note": "e2e2"}]
+        self.assertTrue(bc.save_popup_rules(rules))
+        os.utime(bc.POPUP_RULES_PATH, (_t.time() + 5, _t.time() + 5))   # 保证 mtime 变了
+        w2 = self._win("BootDoctorE2ENewRule again")
+        w2.show()
+        took = w2.wait_closed(8)
+        self.assertIsNotNone(took, "新增的规则没生效（没热加载）。日志：\n" + self.log())
+
+    def test_f_autostart_change_is_reported(self):
+        """往 Run 键里写一项：守护应当在几秒内把它记进「新增自启」日志。"""
+        import time as _t
+        import winreg
+        try:
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, self.RUN, 0, winreg.KEY_SET_VALUE) as k:
+                winreg.SetValueEx(k, self.PROBE, 0, winreg.REG_SZ, r'"C:\BootDoctorUnitTest\not_exist.exe" --e2e')
+            rows = []
+            end = _t.time() + 20
+            while _t.time() < end and not rows:
+                _t.sleep(0.3)
+                rows = [r for r in bc.autostart_watch_log(50) if r.get("name") == self.PROBE]
+            self.assertTrue(rows, "守护没有报出新增的自启项。日志：\n" + self.log())
+            self.assertEqual(rows[0]["change"], "added")
+            self.assertIn("not_exist.exe", rows[0]["cmd"])
+            self.assertIn("自启新增「%s」" % self.PROBE, self.log())
+        finally:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.RUN, 0, winreg.KEY_SET_VALUE) as k:
+                    winreg.DeleteValue(k, self.PROBE)
+            except OSError:
+                pass
+
+    def test_zz_stop_cleanly(self):
+        import time as _t
+        pid = bc.guard_pid()
+        self.assertGreater(pid, 0)
+        ok, msg = bc.stop_popup_guard()
+        self.assertTrue(ok, msg)
+        self.assertNotIn("强制", msg, "守护没有响应停止标记，被强杀了：" + msg)
+        end = _t.time() + 5
+        while _t.time() < end and bc._pid_alive(pid):
+            _t.sleep(0.1)
+        self.assertFalse(bc._pid_alive(pid), "守护进程还活着")
+        self.assertFalse(os.path.exists(bc.GUARD_PID_PATH), "pid 文件没清理")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
