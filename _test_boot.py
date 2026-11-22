@@ -76,6 +76,18 @@ def fake_raw():
     }
 
 
+def fake_raw_multi():
+    """多选 / 批量用例专用：保证至少 3 条普通自启项。
+
+    以前这两个用例靠本机已有的 BootDoctor-Delay 任务凑数，换一台干净机器（CI）就不够 3 条。
+    """
+    raw = fake_raw()
+    for n in ("UnitTestToolA", "UnitTestToolB", "UnitTestToolC"):
+        raw["startup"].append({"name": n, "cmd": n.lower() + ".exe", "source": "用户 Run",
+                               "kind": "run", "hive": "HKCU", "subkey": None, "enabled": True})
+    return raw
+
+
 class TestAnalyze(unittest.TestCase):
     def test_rules_and_score(self):
         res = bc.analyze(fake_raw())
@@ -312,10 +324,11 @@ class TestGuiOffscreen(unittest.TestCase):
         from PyQt5.QtWidgets import QApplication
         import boot_doctor as bd
 
-        res = bc.analyze(fake_raw())
+        raw = fake_raw_multi()
+        res = bc.analyze(raw)
         win = bd.MainWindow(autoscan=False)
         win.show()
-        win.on_scan_done(fake_raw(), res)
+        win.on_scan_done(raw, res)
         rows = []
         for i in range(win.tree.topLevelItemCount()):
             p = win.tree.topLevelItem(i)
@@ -352,10 +365,11 @@ class TestGuiOffscreen(unittest.TestCase):
         from PyQt5.QtWidgets import QApplication
         import boot_doctor as bd
 
-        res = bc.analyze(fake_raw())
+        raw = fake_raw_multi()
+        res = bc.analyze(raw)
         win = bd.MainWindow(autoscan=False)
         win.show()
-        win.on_scan_done(fake_raw(), res)
+        win.on_scan_done(raw, res)
 
         rows = []
         for i in range(win.tree.topLevelItemCount()):
