@@ -34,7 +34,7 @@ import urllib.request
 import winreg
 
 APP_NAME = "开机体检大师"
-VERSION = "1.9.2"
+VERSION = "2.0.0"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 程序运行时产生的数据（备份 / 日志 / 设置 / 规则 / 快照）放哪里。默认就在程序目录；

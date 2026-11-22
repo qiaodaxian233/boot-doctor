@@ -1577,6 +1577,33 @@ class TestNotify(unittest.TestCase):
         self.assertTrue(ok, msg)
         self.assertTrue(self._by_id()[self.NESTED]["enabled"])
 
+    def test_bulk_off_adware_notifications(self):
+        from PyQt5.QtWidgets import QApplication, QMessageBox
+        import boot_doctor as bd
+        app = QApplication.instance() or QApplication([])  # noqa: F841
+        adware_id = r"{6D809377-6AF0-444B-8957-A3773F02200E}\LuDaShi\LdsGameBox.exe"
+        with self.wr.CreateKeyEx(self.wr.HKEY_CURRENT_USER, self.ROOT + "\\" + adware_id) as k:
+            self.wr.SetValueEx(k, "LastNotificationAddedTime", 0, self.wr.REG_QWORD, 133700000000000000)
+        page = bd.NotifyPage(root_sub=self.ROOT)
+        old_q = QMessageBox.question
+        try:
+            self.assertEqual(page.stats()["adware_on"], 1, "鲁大师路径应命中特征库：%r" % page.apps)
+            self.assertFalse(page.btn_adware_off.isHidden())
+            self.assertIn("（1）", page.btn_adware_off.text())
+            QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.No)
+            page.off_adware()
+            self.assertEqual(page.stats()["adware_on"], 1, "点了「否」不该关")
+            QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+            page.off_adware()
+            self.assertEqual(page.stats()["adware_on"], 0)
+            self.assertTrue(page.btn_adware_off.isHidden(), "没有可关的了，按钮应隐藏")
+            by = {a["aumid"]: a for a in page.apps}
+            self.assertFalse(by[adware_id]["enabled"])
+            self.assertTrue(by["UnitTest.PlainApp"]["enabled"], "只该关流氓软件的，别的不能动")
+        finally:
+            QMessageBox.question = old_q
+            page.close()
+
     def test_page_toggles_selected(self):
         from PyQt5.QtWidgets import QApplication
         import boot_doctor as bd

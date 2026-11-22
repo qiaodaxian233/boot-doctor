@@ -1572,6 +1572,10 @@ class NotifyPage(QWidget):
         self.btn_on = QPushButton("恢复通知")
         self.btn_on.clicked.connect(lambda: self.set_selected(True))
         bar.addWidget(self.btn_on)
+        self.btn_adware_off = QPushButton("")
+        self.btn_adware_off.setToolTip("把命中流氓软件特征库、且还在发通知的应用一次性全部关掉")
+        self.btn_adware_off.clicked.connect(self.off_adware)
+        bar.addWidget(self.btn_adware_off)
         self.chk_hide_sys = QCheckBox("隐藏系统自带")
         self.chk_hide_sys.setChecked(True)
         self.chk_hide_sys.stateChanged.connect(lambda _s: self._fill())
@@ -1635,6 +1639,8 @@ class NotifyPage(QWidget):
             shown += 1
         st = self.stats()
         self.lbl_count.setText("显示 %d / 共 %d 个应用，%d 个允许通知" % (shown, st["total"], st["on"]))
+        self.btn_adware_off.setText("关闭所有流氓软件的通知（%d）" % st["adware_on"])
+        self.btn_adware_off.setVisible(st["adware_on"] > 0)
         self._sync_buttons()
 
     def _sync_buttons(self):
@@ -1648,6 +1654,21 @@ class NotifyPage(QWidget):
         a = next((x for x in self.apps if x["aumid"] == aumid), None)
         if a:
             self._apply([aumid], not a["enabled"])
+
+    @guard
+    def off_adware(self):
+        hits = [a for a in self.apps if a["enabled"] and a["adware"]]
+        if not hits:
+            return
+        names = "\n".join("· %s（%s）" % (a["name"], a["adware"]) for a in hits[:12])
+        if len(hits) > 12:
+            names += "\n… 共 %d 个" % len(hits)
+        if QMessageBox.question(
+                self, "关闭流氓软件的通知",
+                "将关闭这 %d 个应用的系统通知：\n\n%s\n\n之后可以随时在这里恢复。" % (len(hits), names),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) != QMessageBox.Yes:
+            return
+        self._apply([a["aumid"] for a in hits], False)
 
     @guard
     def set_selected(self, on):
