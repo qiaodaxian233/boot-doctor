@@ -113,3 +113,23 @@ if isinstance(raw, dict):
         timed("签名校验 %d 个（串行）" % len(apps),
               lambda: [bc.app_signature(a) for a in apps.values()])
         print("  发现项 %d 个" % len(res.get("findings") or []))
+
+print("\n[签名校验成本：系统目录前 40 个 exe，冷缓存]")
+sysdir = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+exes = sorted(n for n in os.listdir(sysdir) if n.lower().endswith(".exe"))[:40]
+infos = [bc.describe_app(os.path.join(sysdir, n)) for n in exes]
+infos = [i for i in infos if i.get("exists")]
+t = time.perf_counter()
+for i in infos:
+    bc.app_signature(i)
+print("  串行 %d 个：%.0f ms（平均 %.1f ms/个）" % (
+    len(infos), (time.perf_counter() - t) * 1000, (time.perf_counter() - t) * 1000 / max(1, len(infos))))
+bc._SIG_CACHE.clear()
+t = time.perf_counter()
+bc.warm_signatures(infos)
+print("  6 线程并行 %d 个：%.0f ms" % (len(infos), (time.perf_counter() - t) * 1000))
+st = {}
+for i in infos:
+    r = bc.app_signature(i)
+    st[(r["state"], bool(bc.real_microsoft(r)))] = st.get((r["state"], bool(bc.real_microsoft(r))), 0) + 1
+print("  结果分布（状态, 是否认成微软）：%s" % sorted(st.items()))

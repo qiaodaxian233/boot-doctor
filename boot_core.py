@@ -1119,8 +1119,55 @@ def _match_family(text_path, text_name, text_pub):
     return None
 
 
+def _verify_target(path, cmd=""):
+    """找一个能拿去验签名的真实文件：路径本身，或命令行里的 exe。找不到返回 {}。"""
+    cands = [path or ""]
+    for raw in (cmd, path):
+        if raw:
+            try:
+                cands.append(split_cmdline(raw)[0])
+            except Exception:
+                pass
+    for c in cands:
+        c = os.path.expandvars((c or "").strip().strip('"'))
+        if c and os.path.isfile(c):
+            try:
+                st = os.stat(c)
+                return {"path": c, "exists": True, "size": int(st.st_size),
+                        "mtime": int(st.st_mtime)}
+            except OSError:
+                pass
+    return {}
+
+
 def adware_check(path="", name="", company="", cmd=""):
-    """判定单个对象是否属于流氓软件 / 全家桶。
+    """判定单个对象是否属于流氓软件 / 全家桶（对外入口）。
+
+    以前一看公司名写着 Microsoft 就直接放行，可公司名是文件自己填的，
+    流氓软件把公司名改成 Microsoft，所有检测都失效。现在先照常比对特征库，
+    **只有命中了、且它自称微软时**才去核实数字签名：
+      · 签名确实是微软的 → 放过（和以前一样，系统自带组件不误报）
+      · 不是 → 不放过，并提到高危，说明里写明「自称微软却没有微软签名」
+    核实只发生在命中之后，所以平时不增加扫描耗时。
+    """
+    r = _adware_check_raw(path, name, company, cmd)
+    if not r.get("hit"):
+        return r
+    if not _claims_microsoft(path, company):
+        return r
+    tgt = _verify_target(path, cmd)
+    if not tgt or _ms_claim_holds(tgt):
+        return {"hit": False}
+    sig = app_signature(tgt)
+    who = sig.get("signer") or ("无数字签名" if sig.get("state") == "unsigned" else "签名无效")
+    pretend = "microsoft" in (company or "").lower()
+    extra = ("；而且它自称是微软组件，但数字签名者是「%s」，不是微软（疑似冒充）" % who
+             if pretend else "；而且它放在系统目录里，却没有微软的数字签名（签名者：%s）" % who)
+    return dict(r, sev="high", why=(r.get("why") or "") + extra, spoof=True)
+
+
+def _adware_check_raw(path="", name="", company="", cmd=""):
+    """判定单个对象是否属于流氓软件 / 全家桶（不做「自称微软」的豁免，由 adware_check 负责）。
 
     返回 dict：
       hit     是否命中
@@ -1136,13 +1183,6 @@ def adware_check(path="", name="", company="", cmd=""):
     c = (company or "").lower()
     cmdl = (cmd or "").lower()
     blob_path = p + " " + cmdl
-
-    # 微软自家组件直接放过，避免把系统组件误判
-    win = os.environ.get("SystemRoot", r"C:\Windows").lower()
-    if "microsoft" in c or "windows" == c:
-        return {"hit": False}
-    if p.startswith(win + "\\") and not c:
-        return {"hit": False}
 
     # 0) 上游白名单：明确登记过的误报（redis-server.exe / mysqld.exe …），先放过
     if db.get("_white"):
@@ -3651,6 +3691,34 @@ class _CATALOG_INFO(ctypes.Structure):
     _fields_ = [("cbStruct", ctypes.c_ulong), ("wszCatalogFile", ctypes.c_wchar * 260)]
 
 
+class _WT_DATA_U(ctypes.Structure):
+    """WINTRUST_DATA，联合体字段用 void*：文件签名和目录签名两种校验共用。"""
+    _fields_ = [
+        ("cbStruct", ctypes.c_ulong), ("pPolicyCallbackData", ctypes.c_void_p),
+        ("pSIPClientData", ctypes.c_void_p), ("dwUIChoice", ctypes.c_ulong),
+        ("fdwRevocationChecks", ctypes.c_ulong), ("dwUnionChoice", ctypes.c_ulong),
+        ("pUnion", ctypes.c_void_p), ("dwStateAction", ctypes.c_ulong),
+        ("hWVTStateData", ctypes.c_void_p), ("pwszURLReference", ctypes.c_wchar_p),
+        ("dwProvFlags", ctypes.c_ulong), ("dwUIContext", ctypes.c_ulong),
+        ("pSignatureSettings", ctypes.c_void_p),
+    ]
+
+
+class _WT_CATALOG_INFO(ctypes.Structure):
+    _fields_ = [
+        ("cbStruct", ctypes.c_ulong), ("dwCatalogVersion", ctypes.c_ulong),
+        ("pcwszCatalogFilePath", ctypes.c_wchar_p), ("pcwszMemberTag", ctypes.c_wchar_p),
+        ("pcwszMemberFilePath", ctypes.c_wchar_p), ("hMemberFile", ctypes.c_void_p),
+        ("pbCalculatedFileHash", ctypes.c_void_p), ("cbCalculatedFileHash", ctypes.c_ulong),
+        ("pcCatalogContext", ctypes.c_void_p), ("hCatAdmin", ctypes.c_void_p),
+    ]
+
+
+class _CRYPT_PROVIDER_CERT(ctypes.Structure):
+    """只用到前两个字段：证书上下文指针（后面的字段不读，省得和系统头文件对不上）。"""
+    _fields_ = [("cbStruct", ctypes.c_ulong), ("pCert", ctypes.c_void_p)]
+
+
 def _init_sig_api():
     """显式声明 argtypes/restype：64 位下不声明会截断指针（实测会 AV 崩）。"""
     global _sig_ready
@@ -3685,6 +3753,18 @@ def _init_sig_api():
         wv.CryptCATAdminReleaseCatalogContext.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
         wv.CryptCATAdminReleaseContext.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        # 取签名者证书：WinVerifyTrust 的状态句柄 → 签名者 → 证书链第 0 个（叶子）→ 显示名
+        wv.WTHelperProvDataFromStateData.restype = ctypes.c_void_p
+        wv.WTHelperProvDataFromStateData.argtypes = [ctypes.c_void_p]
+        wv.WTHelperGetProvSignerFromChain.restype = ctypes.c_void_p
+        wv.WTHelperGetProvSignerFromChain.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                                      ctypes.c_int, ctypes.c_ulong]
+        wv.WTHelperGetProvCertFromChain.restype = ctypes.c_void_p
+        wv.WTHelperGetProvCertFromChain.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        c32 = ctypes.windll.crypt32
+        c32.CertGetNameStringW.restype = ctypes.c_ulong
+        c32.CertGetNameStringW.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+                                           ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_ulong]
         _sig_ready = True
     except Exception as e:
         log_line("sig api init failed: %r" % (e,))
@@ -3692,8 +3772,43 @@ def _init_sig_api():
     return _sig_ready
 
 
+def _wt_guid():
+    g = _GUID()
+    ctypes.windll.ole32.CLSIDFromString(
+        ctypes.c_wchar_p(_WINTRUST_ACTION_GENERIC_VERIFY_V2), ctypes.byref(g))
+    return g
+
+
+def _signer_from_state(wv, state):
+    """从 WinVerifyTrust 的状态句柄里取签名者（叶子证书的显示名，如「Microsoft Corporation」）。
+
+    必须在 WTD_STATEACTION_CLOSE 之前调用：关掉以后句柄指向的数据就没了。
+    取不到返回 ""，不抛异常——签名者只是附加信息，取不到不能影响签名状态本身。
+    """
+    try:
+        if not state:
+            return ""
+        prov = wv.WTHelperProvDataFromStateData(state)
+        if not prov:
+            return ""
+        sgnr = wv.WTHelperGetProvSignerFromChain(prov, 0, 0, 0)
+        if not sgnr:
+            return ""
+        pc = wv.WTHelperGetProvCertFromChain(sgnr, 0)
+        if not pc:
+            return ""
+        cert = ctypes.cast(pc, ctypes.POINTER(_CRYPT_PROVIDER_CERT)).contents.pCert
+        if not cert:
+            return ""
+        buf = ctypes.create_unicode_buffer(256)
+        n = ctypes.windll.crypt32.CertGetNameStringW(cert, 4, 0, None, buf, 256)  # SIMPLE_DISPLAY_TYPE
+        return buf.value if n > 1 else ""
+    except Exception:
+        return ""
+
+
 def _sig_embedded(path):
-    """内嵌签名状态：valid / invalid / none。"""
+    """内嵌签名：返回 (状态 valid / invalid / none, WinVerifyTrust 返回码, 签名者)。"""
     wv = ctypes.windll.wintrust
     fi = _WT_FILE_INFO()
     fi.cbStruct = ctypes.sizeof(_WT_FILE_INFO)
@@ -3708,80 +3823,139 @@ def _sig_embedded(path):
     d.pFile = ctypes.pointer(fi)
     d.dwStateAction = _WTD_STATEACTION_VERIFY
     d.dwProvFlags = _WTD_SAFER_FLAG | _WTD_CACHE_ONLY_URL_RETRIEVAL
-    g = _GUID()
-    ctypes.windll.ole32.CLSIDFromString(
-        ctypes.c_wchar_p(_WINTRUST_ACTION_GENERIC_VERIFY_V2), ctypes.byref(g))
+    g = _wt_guid()
     rc = wv.WinVerifyTrust(None, ctypes.byref(g), ctypes.byref(d)) & 0xFFFFFFFF
+    signer = ""
+    if rc not in (_TRUST_E_NOSIGNATURE, _TRUST_E_SUBJECT_FORM_UNKNOWN):
+        signer = _signer_from_state(wv, d.hWVTStateData)
     d.dwStateAction = _WTD_STATEACTION_CLOSE
     wv.WinVerifyTrust(None, ctypes.byref(g), ctypes.byref(d))
     if rc == 0:
-        return "valid", rc
+        return "valid", rc, signer
     if rc in (_TRUST_E_NOSIGNATURE, _TRUST_E_SUBJECT_FORM_UNKNOWN):
-        return "none", rc
-    return "invalid", rc
+        return "none", rc, ""
+    return "invalid", rc, signer
+
+
+def _verify_catalog_member(wv, path, cat, hash_buf, hash_len, h_file, h_admin):
+    """按目录文件校验一个成员：返回 (签名者, 是否校验通过)。"""
+    tag = "".join("%02X" % hash_buf[i] for i in range(hash_len))
+    ci = _WT_CATALOG_INFO()
+    ci.cbStruct = ctypes.sizeof(_WT_CATALOG_INFO)
+    ci.dwCatalogVersion = 0
+    ci.pcwszCatalogFilePath = cat
+    ci.pcwszMemberTag = tag
+    ci.pcwszMemberFilePath = path
+    ci.hMemberFile = h_file
+    ci.pbCalculatedFileHash = ctypes.cast(hash_buf, ctypes.c_void_p)
+    ci.cbCalculatedFileHash = hash_len
+    ci.pcCatalogContext = None
+    ci.hCatAdmin = h_admin
+    d = _WT_DATA_U()
+    d.cbStruct = ctypes.sizeof(_WT_DATA_U)
+    d.dwUIChoice = _WTD_UI_NONE
+    d.fdwRevocationChecks = _WTD_REVOKE_NONE
+    d.dwUnionChoice = 2                                  # WTD_CHOICE_CATALOG
+    d.pUnion = ctypes.cast(ctypes.pointer(ci), ctypes.c_void_p)
+    d.dwStateAction = _WTD_STATEACTION_VERIFY
+    d.dwProvFlags = _WTD_SAFER_FLAG | _WTD_CACHE_ONLY_URL_RETRIEVAL
+    g = _wt_guid()
+    rc = wv.WinVerifyTrust(None, ctypes.byref(g), ctypes.byref(d)) & 0xFFFFFFFF
+    signer = _signer_from_state(wv, d.hWVTStateData)
+    d.dwStateAction = _WTD_STATEACTION_CLOSE
+    wv.WinVerifyTrust(None, ctypes.byref(g), ctypes.byref(d))
+    return signer, rc == 0
+
+
+def _sig_catalog(path):
+    """查 Windows 目录签名（CatRoot 下的 .cat）并校验：返回 (.cat 路径, 签名者, 是否校验通过)。
+
+    SHA256 查不到再用 SHA1：老系统文件的目录签名是 SHA1 哈希，只查 SHA256 会漏。
+    没命中返回 ("", "", False)。
+    """
+    wv = ctypes.windll.wintrust
+    k32 = ctypes.windll.kernel32
+    h_file = k32.CreateFileW(path, 0x80000000, 1, None, 3, 0x80, None)
+    if not h_file or h_file == ctypes.c_void_p(-1).value:
+        return "", "", False
+    try:
+        for alg in ("SHA256", "SHA1"):
+            h_admin = ctypes.c_void_p()
+            if not wv.CryptCATAdminAcquireContext2(
+                    ctypes.byref(h_admin), None, ctypes.c_wchar_p(alg), None, 0):
+                continue
+            try:
+                n = ctypes.c_ulong(0)
+                if not wv.CryptCATAdminCalcHashFromFileHandle2(
+                        h_admin, h_file, ctypes.byref(n), None, 0) or not n.value:
+                    continue
+                buf = (ctypes.c_ubyte * n.value)()
+                if not wv.CryptCATAdminCalcHashFromFileHandle2(
+                        h_admin, h_file, ctypes.byref(n), buf, 0):
+                    continue
+                info = wv.CryptCATAdminEnumCatalogFromHash(h_admin, buf, n.value, 0, None)
+                if not info:
+                    continue
+                ci = _CATALOG_INFO()
+                ci.cbStruct = ctypes.sizeof(_CATALOG_INFO)
+                got = wv.CryptCATCatalogInfoFromContext(info, ctypes.byref(ci), 0)
+                wv.CryptCATAdminReleaseCatalogContext(h_admin, info, 0)
+                if not got or not ci.wszCatalogFile:
+                    continue
+                cat = ci.wszCatalogFile
+                try:
+                    signer, ok = _verify_catalog_member(wv, path, cat, buf, n.value,
+                                                        h_file, h_admin)
+                except Exception as e:
+                    log_line("catalog verify failed %s: %r" % (path, e))
+                    signer, ok = "", False
+                return cat, signer, ok
+            finally:
+                wv.CryptCATAdminReleaseContext(h_admin, 0)
+    finally:
+        k32.CloseHandle(h_file)
+    return "", "", False
 
 
 def _sig_catalog_path(path):
-    """查 Windows 目录签名（CatRoot 下的 .cat）：命中返回 .cat 路径，否则 ''。"""
-    wv = ctypes.windll.wintrust
-    k32 = ctypes.windll.kernel32
-    h_admin = ctypes.c_void_p()
-    if not wv.CryptCATAdminAcquireContext2(
-            ctypes.byref(h_admin), None, ctypes.c_wchar_p("SHA256"), None, 0):
-        return ""
-    h_file = k32.CreateFileW(path, 0x80000000, 1, None, 3, 0x80, None)
-    if not h_file or h_file == ctypes.c_void_p(-1).value:
-        wv.CryptCATAdminReleaseContext(h_admin, 0)
-        return ""
-    try:
-        n = ctypes.c_ulong(0)
-        if not wv.CryptCATAdminCalcHashFromFileHandle2(
-                h_admin, h_file, ctypes.byref(n), None, 0) or not n.value:
-            return ""
-        buf = (ctypes.c_ubyte * n.value)()
-        if not wv.CryptCATAdminCalcHashFromFileHandle2(
-                h_admin, h_file, ctypes.byref(n), buf, 0):
-            return ""
-    finally:
-        k32.CloseHandle(h_file)
-    info = wv.CryptCATAdminEnumCatalogFromHash(h_admin, buf, n.value, 0, None)
-    out = ""
-    if info:
-        ci = _CATALOG_INFO()
-        ci.cbStruct = ctypes.sizeof(_CATALOG_INFO)
-        if wv.CryptCATCatalogInfoFromContext(info, ctypes.byref(ci), 0):
-            out = ci.wszCatalogFile
-        wv.CryptCATAdminReleaseCatalogContext(h_admin, info, 0)
-    wv.CryptCATAdminReleaseContext(h_admin, 0)
-    return out or ""
+    """（兼容旧调用）只要 .cat 路径。"""
+    return _sig_catalog(path)[0]
 
 
 def app_signature(info):
     """给一条应用信息算签名状态，带缓存（按 路径+大小+修改时间 失效）。
 
-    返回 {state, label, detail, cat}
+    返回 {state, label, detail, cat, signer, signer_ok, rc}
       state: valid / catalog / unsigned / invalid / missing / unknown
+      signer     真实签名者（证书上的名字，不是文件版本信息里自己写的公司名）
+      signer_ok  签名者这一项是否经过校验（目录签名要校验目录文件本身）
     """
     info = info or {}
     path = info.get("path") or ""
     if not path:
-        return {"state": "unknown", "label": "", "detail": "", "cat": ""}
+        return {"state": "unknown", "label": "", "detail": "", "cat": "",
+                "signer": "", "signer_ok": False, "rc": 0}
     if not info.get("exists", os.path.isfile(path)):
         return {"state": "missing", "label": "文件不存在",
-                "detail": "磁盘上找不到这个文件，多半是卸载/改名后的残留。", "cat": ""}
+                "detail": "磁盘上找不到这个文件，多半是卸载/改名后的残留。", "cat": "",
+                "signer": "", "signer_ok": False, "rc": 0}
     if not path.lower().endswith((".exe", ".dll", ".sys", ".ocx", ".cpl", ".msi")):
-        return {"state": "unknown", "label": "—", "detail": "该类型不做签名校验。", "cat": ""}
+        return {"state": "unknown", "label": "—", "detail": "该类型不做签名校验。", "cat": "",
+                "signer": "", "signer_ok": False, "rc": 0}
     key = "%s|%s|%s" % (path.lower(), info.get("size", 0), info.get("mtime", 0))
     hit = _SIG_CACHE.get(key)
     if hit:
         return hit
     if not _init_sig_api():
-        return {"state": "unknown", "label": "—", "detail": "系统 API 不可用。", "cat": ""}
+        return {"state": "unknown", "label": "—", "detail": "系统 API 不可用。", "cat": "",
+                "signer": "", "signer_ok": False, "rc": 0}
+    base = {"cat": "", "signer": "", "signer_ok": False, "rc": 0}
     try:
-        st, rc = _sig_embedded(path)
+        st, rc, signer = _sig_embedded(path)
         if st == "valid":
-            res = {"state": "valid", "label": "已签名",
-                   "detail": "文件带完整数字签名，且校验通过（文件未被改动）。", "cat": ""}
+            res = dict(base, state="valid", label="已签名", signer=signer, signer_ok=True,
+                       detail="文件带完整数字签名，且校验通过（文件未被改动）。"
+                              + ("\n签名者：%s" % signer if signer else ""))
         elif st == "invalid":
             why = {
                 _TRUST_E_BAD_DIGEST: "签名与文件内容对不上——文件被改过，或签名已损坏。",
@@ -3790,34 +3964,97 @@ def app_signature(info):
                 _CERT_E_CHAINING: "证书链不完整，无法建到受信任的根。",
                 _TRUST_E_SUBJECT_NOT_TRUSTED: "签名主体不被信任。",
             }.get(rc, "签名校验未通过（错误码 0x%08X）。" % rc)
-            res = {"state": "invalid", "label": "签名无效", "detail": why, "cat": ""}
+            res = dict(base, state="invalid", label="签名无效", rc=rc, signer=signer,
+                       detail=why + ("\n签名者（未通过校验）：%s" % signer if signer else ""))
         else:
-            cat = _sig_catalog_path(path)
+            cat, csigner, cok = _sig_catalog(path)
             if cat:
-                res = {"state": "catalog", "label": "目录签名",
-                       "detail": "由系统目录签名（CatRoot）覆盖：\n%s" % cat, "cat": cat}
+                res = dict(base, state="catalog", label="目录签名", cat=cat,
+                           signer=csigner, signer_ok=cok,
+                           detail="由系统目录签名（CatRoot）覆盖：\n%s" % cat
+                                  + ("\n签名者：%s" % csigner if csigner else ""))
             else:
-                res = {"state": "unsigned", "label": "未签名",
-                       "detail": "既没有内嵌签名，也不在任何系统目录签名里。"
-                                 "自研/绿色软件常见，但来源不明的自启项要当心。", "cat": ""}
+                res = dict(base, state="unsigned", label="未签名",
+                           detail="既没有内嵌签名，也不在任何系统目录签名里。"
+                                  "自研/绿色软件常见，但来源不明的自启项要当心。")
     except Exception as e:
-        res = {"state": "unknown", "label": "—", "detail": "校验失败：%r" % (e,), "cat": ""}
+        res = dict(base, state="unknown", label="—", detail="校验失败：%r" % (e,))
     _SIG_CACHE[key] = res
     return res
 
 
-def is_microsoft(info):
-    """粗判这一项是否属于微软/Windows 自家组件（用于「只看第三方」过滤）。"""
-    info = info or {}
-    comp = (info.get("company") or "").lower()
-    if "microsoft" in comp or "windows" == comp:
+def warm_signatures(infos, workers=6):
+    """并行把一批应用的签名结果放进缓存（WinVerifyTrust 是阻塞调用，ctypes 会释放 GIL）。"""
+    from concurrent.futures import ThreadPoolExecutor
+    todo = {}
+    for a in infos or []:
+        if a and a.get("path") and a.get("exists"):
+            todo[a["path"].lower()] = a
+
+    def one(a):
+        try:
+            app_signature(a)
+        except Exception:
+            pass
+
+    if todo:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(one, todo.values()))
+    return len(todo)
+
+
+# 真正由微软自己签名的签名者名。注意不含「Microsoft Windows Hardware Compatibility Publisher」：
+# 那是微软给第三方驱动做 WHQL 认证时签的，驱动本身不是微软写的。
+_MS_SIGNERS = ("microsoft corporation", "microsoft windows", "microsoft windows publisher")
+
+
+def _ms_ish(signer):
+    return (signer or "").strip().lower().startswith("microsoft")
+
+
+def real_microsoft(sig):
+    """签名结果是不是「微软自己签的」：签名校验通过，且签名者在微软名单里。"""
+    sig = sig or {}
+    return (sig.get("state") in ("valid", "catalog") and bool(sig.get("signer_ok"))
+            and (sig.get("signer") or "").strip().lower() in _MS_SIGNERS)
+
+
+def _claims_microsoft(path="", company=""):
+    """文件自称是微软 / Windows 组件：公司名写了 Microsoft，或在系统目录里却没有公司名。"""
+    c = (company or "").lower()
+    if "microsoft" in c or c == "windows":
         return True
-    path = (info.get("path") or "").lower()
     win = os.environ.get("SystemRoot", r"C:\Windows").lower()
-    if path.startswith(win + os.sep):
-        # 系统目录里也有第三方驱动，公司名有值时不按路径算
-        return not comp
-    return False
+    return bool((path or "").lower().replace("/", "\\").startswith(win + "\\") and not c)
+
+
+def _ms_claim_holds(info):
+    """「自称微软」这句话站不站得住。
+
+    公司名取自文件版本资源，任何人都能随便写，不能当凭据——真正的凭据是数字签名。
+    取不到证据时（没路径 / 文件不在 / 系统 API 不可用 / 不是可签名的文件类型）
+    按没法反驳处理，沿用以前的做法，不制造误判。
+    """
+    info = info or {}
+    path = info.get("path") or ""
+    if not path or not info.get("exists", os.path.isfile(path)):
+        return True
+    sig = app_signature(info)
+    if sig.get("state") in ("unknown", "missing"):
+        return True
+    return real_microsoft(sig)
+
+
+def is_microsoft(info):
+    """这一项是不是微软 / Windows 自家组件（用于「只看第三方」过滤、跳过微软任务）。
+
+    先看它自称是不是微软，自称的再用数字签名核实：公司名可以随便填，
+    以前只看公司名，把公司名写成 Microsoft 就能躲进「微软组件」里不被列出来。
+    """
+    info = info or {}
+    if not _claims_microsoft(info.get("path") or "", info.get("company") or ""):
+        return False
+    return _ms_claim_holds(info)
 
 
 def _host_target(info):
@@ -4185,6 +4422,51 @@ def _remove_delay_task(task_name, dry_run=False):
     if "OK" in out:
         return True, "已删除延迟任务：%s" % task_name
     return False, "删除任务失败：%s（可能已不存在）" % task_name
+
+
+def _ms_spoof_findings(F, add):
+    """公司名写着 Microsoft、数字签名却不是微软的文件：给一条体检项。
+
+    只在证据确凿时报，宁可漏报也不吓用户：
+      · 签名校验通过，但签名者是别人（名字不以 Microsoft 开头）  → 高危
+      · 文件被改过（签名与内容对不上 / 证书被吊销）                → 高危
+      · 完全没签名，且放在系统目录和 Program Files 之外（AppData / Temp / ProgramData 一类
+        恶意程序最爱待的地方）                                      → 中危
+    系统目录里的文件不查「没签名」：老系统文件的目录签名有可能漏查，那里有系统文件保护，
+    被替换要先拿到最高权限。
+    """
+    cands = {}
+    for f in F:
+        a = f.get("app") or {}
+        if a.get("path") and a.get("exists") and "microsoft" in (a.get("company") or "").lower():
+            cands.setdefault(a["path"].lower(), a)
+    if not cands:
+        return
+    warm_signatures(list(cands.values()))
+    roots = tuple(x.lower().rstrip("\\") + "\\" for x in (
+        os.environ.get("SystemRoot", r"C:\Windows"), os.environ.get("ProgramFiles", ""),
+        os.environ.get("ProgramFiles(x86)", ""), os.environ.get("ProgramW6432", "")) if x)
+    for key, a in cands.items():
+        sig = app_signature(a)
+        st, signer = sig.get("state"), (sig.get("signer") or "")
+        sev = why = ""
+        if st == "valid" and signer and not _ms_ish(signer):
+            sev, why = "high", "数字签名校验通过，但签名者是「%s」，不是微软" % signer
+        elif st == "invalid" and sig.get("rc") in (_TRUST_E_BAD_DIGEST, _TRUST_E_EXPLICIT_DISTRUST):
+            sev, why = "high", "数字签名无效：%s" % (sig.get("detail") or "").split("\n")[0]
+        elif st == "unsigned" and not key.replace("/", "\\").startswith(roots):
+            sev, why = "mid", "文件没有任何数字签名，而且放在系统目录和 Program Files 之外"
+        if not sev:
+            continue
+        name = a.get("desc") or os.path.basename(a["path"])
+        add(id="ms_spoof@" + key, cat="流氓软件", sev=sev, name=name, src="冒充微软",
+            title="疑似冒充微软组件：%s" % name,
+            short="公司名写的是 Microsoft，但签名对不上",
+            app=a,
+            detail=("这个文件在版本信息里把公司写成了「%s」，但是：\n\n● %s\n\n"
+                    "公司名只是文件自己填的一行字，谁都能写；真正由微软发布的程序都带微软的数字签名。"
+                    "来源不明的话，建议先别运行，用杀毒软件扫一遍，确认后再删除。\n\n"
+                    "本工具不会自动处理这一项。") % (a.get("company") or "Microsoft", why))
 
 
 def analyze(raw):
@@ -4805,6 +5087,12 @@ def analyze(raw):
                 "· 关闭未使用的控制器、PXE 网络启动\n"
                 "· 精简启动顺序（多硬盘时尤其明显）\n\n"
                 "本项仅供了解，无需在系统内做任何操作。"))
+
+    # ---------------- 冒充微软 ----------------
+    try:
+        _ms_spoof_findings(F, add)
+    except Exception as e:
+        log_line("ms spoof check failed: %r" % (e,))
 
     # ---------------- 排序 / 计分 ----------------
     # prio 小的排前面：已经改成延迟启动的项（用户最关心）优先于"可以改"的候选项
