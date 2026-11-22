@@ -14,9 +14,11 @@ text = p.stdout.decode("utf-8", "replace")
 sys.stdout.write(text)
 sys.stdout.flush()
 
-CHUNK, MAX_CHUNKS = 30000, 8                  # GitHub 每步最多 10 条 notice、单条 64KB
-tail = text[-CHUNK * MAX_CHUNKS:]
-chunks = [tail[i:i + CHUNK] for i in range(0, len(tail), CHUNK)] or ["（无输出）"]
+# 实测 annotation 正文超过约 4KB 会被截断；每步最多 10 条。取输出末尾（失败详情在最后）
+CHUNK_BYTES, MAX_CHUNKS = 3800, 9
+data = text.encode("utf-8")[-CHUNK_BYTES * MAX_CHUNKS:]
+chunks = [data[i:i + CHUNK_BYTES].decode("utf-8", "ignore")
+          for i in range(0, len(data), CHUNK_BYTES)] or ["（无输出）"]
 
 
 def esc(s):
