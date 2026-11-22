@@ -33,7 +33,7 @@ import urllib.request
 import winreg
 
 APP_NAME = "开机体检大师"
-VERSION = "1.9.0"
+VERSION = "1.9.2"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKUP_DIR = os.path.join(BASE_DIR, "_backups")
