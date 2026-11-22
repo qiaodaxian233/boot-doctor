@@ -71,6 +71,7 @@ FIX_DESC = {
     "startup_delete": "彻底删除自启项（删注册表值 / 启动文件夹快捷方式，原值或文件已备份）",
     "task_off": "禁用开机/登录触发的计划任务",
     "reg_edit": "修改浏览器 / 网络相关的注册表设置（原值已备份，可还原）",
+    "reg_key_delete": "删除别的软件在注册表里登记的浏览器扩展（整个键含全部值已备份，可还原）",
     "defender_pua": "开启 Windows Defender 的「潜在有害应用拦截」（拦截下载器 / 捆绑推广软件，原设置已备份）",
     "proc_kill": "结束正在运行的流氓软件进程（只结束当前进程，无法还原；要根治请同时处理它的自启项 / 卸载）",
     "hosts_clean": "从 hosts 文件里删掉被劫持的行（整个文件已备份，可还原）",
@@ -3008,10 +3009,74 @@ def analyze_shortcut(e):
     return None
 
 
+# 别的软件给浏览器「外部安装」扩展的注册表入口：浏览器启动时会按这里的清单装 / 更新扩展。
+# 正规软件（Adobe、杀软…）也用，但捆绑软件最爱用它悄悄塞扩展：改主页、注入广告、读浏览记录
+_EXT_ROOTS = (
+    ("Chrome", "HKLM", r"SOFTWARE\Google\Chrome\Extensions"),
+    ("Chrome", "HKLM", r"SOFTWARE\Wow6432Node\Google\Chrome\Extensions"),
+    ("Chrome", "HKCU", r"SOFTWARE\Google\Chrome\Extensions"),
+    ("Edge", "HKLM", r"SOFTWARE\Microsoft\Edge\Extensions"),
+    ("Edge", "HKLM", r"SOFTWARE\Wow6432Node\Microsoft\Edge\Extensions"),
+    ("Edge", "HKCU", r"SOFTWARE\Microsoft\Edge\Extensions"),
+)
+_EXT_ID_RE = re.compile(r"^[a-p]{32}$")
+_STORE_HOSTS = ("clients2.google.com", "clients2.googleusercontent.com", "chrome.google.com",
+                "edge.microsoft.com", "microsoftedge.microsoft.com")
+
+
+def read_external_extensions(roots=None):
+    """被别的程序通过注册表登记进浏览器的扩展：[{browser, hive, subkey, ext_id, update_url, path, version}]。"""
+    out = []
+    for browser, hive, base in (roots if roots is not None else _EXT_ROOTS):
+        root = _root_of(hive)
+        try:
+            with winreg.OpenKey(root, base, 0, winreg.KEY_READ) as k:
+                ids = [winreg.EnumKey(k, i) for i in range(winreg.QueryInfoKey(k)[0])]
+        except OSError:
+            continue
+        for eid in ids:
+            if not _EXT_ID_RE.match(eid):
+                continue
+            sub = base + "\\" + eid
+            out.append({"browser": browser, "hive": hive, "subkey": sub, "ext_id": eid,
+                        "update_url": _reg_str(root, sub, "update_url"),
+                        "path": _reg_str(root, sub, "path"),
+                        "version": _reg_str(root, sub, "version")})
+    return out
+
+
+def analyze_extension(e):
+    """判断一个外部登记的扩展。返回 {sev, store, why}：
+
+      来自官方商店（只是被别的程序登记）           → info
+      更新地址不是官方商店 / 本地 .crx 文件         → mid
+      明文 http / IP 地址 / 导航站 / 文件在 Temp 等  → high
+    """
+    url, path = (e.get("update_url") or "").strip(), (e.get("path") or "").strip()
+    host = _host_of(url)
+    if url:
+        if _dom_match(host, _STORE_HOSTS):
+            return {"sev": "info", "store": True,
+                    "why": "更新地址是官方商店（%s）：扩展本身来自商店，只是被别的程序登记进来的" % host}
+        bad = (url.lower().startswith("http://") or re.match(r"^\d+\.\d+\.\d+\.\d+$", host or "")
+               or is_nav_host(host))
+        return {"sev": "high" if bad else "mid", "store": False,
+                "why": "更新地址不是官方商店：%s%s" % (url[:90],
+                                                  "（明文 HTTP / IP 地址 / 导航站，更可疑）" if bad else "")}
+    if path:
+        gone = not os.path.isfile(os.path.expandvars(path))
+        if gone:
+            return {"sev": "low", "store": False, "why": "登记的 .crx 文件已经不在了：%s" % path[:90]}
+        sev = "high" if _in_user_dropzone(path) else "mid"
+        return {"sev": sev, "store": False,
+                "why": "从本地 .crx 文件安装：%s%s" % (path[:90], "（位于 Temp / AppData 一类位置）" if sev == "high" else "")}
+    return {"sev": "low", "store": False, "why": "登记了扩展 ID，但没有更新地址也没有文件路径"}
+
+
 def collect_hijack():
     """采集浏览器劫持相关的现状（只读，各项独立兜底，任何一项失败都不影响别的）。"""
     d = {"managed": False, "proxy": {}, "listeners": [], "policies": [], "ie": [],
-         "hosts": {}, "lnks": []}
+         "hosts": {}, "lnks": [], "extensions": []}
 
     def safe(key, fn, default):
         try:
@@ -3031,6 +3096,7 @@ def collect_hijack():
     safe("ie", read_ie_pages, [])
     safe("hosts", read_hosts, {})
     safe("lnks", scan_browser_shortcuts, [])
+    safe("extensions", read_external_extensions, [])
     return d
 
 
@@ -3255,10 +3321,50 @@ def _security_findings(sysd, add):
                         "或网络里屏蔽了微软的更新域名（体检的「浏览器劫持」会检查 hosts）。"))
 
 
+def _ext_findings(d, add):
+    """被别的程序通过注册表登记的浏览器扩展：按浏览器合并成一条。商店来源的只提示，其余可清除。"""
+    rows = d.get("extensions") or []
+    if not rows:
+        return
+    managed = bool(d.get("managed"))
+    by = {}
+    for e in rows:
+        by.setdefault(e["browser"], []).append(dict(e, **analyze_extension(e)))
+    order = {"high": 0, "mid": 1, "low": 2, "info": 3}
+    for browser, items in by.items():
+        items.sort(key=lambda x: order.get(x["sev"], 9))
+        worst = items[0]["sev"]
+        sus = [x for x in items if not x["store"]]
+        sev = "info" if managed else worst
+        lines = []
+        for x in items[:12]:
+            lines.append("· %s  [%s]" % (x["ext_id"], x["hive"]))
+            lines.append("    %s" % x["why"])
+            if x["store"] or not x.get("path"):
+                lines.append("    商店页面：https://chromewebstore.google.com/detail/%s" % x["ext_id"]
+                             if browser == "Chrome" else
+                             "    商店页面：https://microsoftedge.microsoft.com/addons/detail/%s" % x["ext_id"])
+        fix = None
+        if sus and not managed:
+            fix = {"type": "reg_key_delete", "risk": "confirm",
+                   "items": [{"hive": x["hive"], "subkey": x["subkey"]} for x in sus]}
+        add(id="hij_ext@" + browser, cat="浏览器劫持", sev=sev,
+            title="%s 有 %d 个扩展是被别的程序通过注册表装进来的" % (browser, len(items)),
+            short=("有 %d 个来源不明" % len(sus)) if sus else "都来自官方商店",
+            detail=("这些扩展不是你在浏览器里点「添加」装的，而是某个程序在注册表里登记，浏览器启动时照单安装 / 更新：\n\n%s\n\n"
+                    "正规软件（Adobe、杀软）也会这样做；但捆绑的推广软件最爱用它悄悄塞扩展——改主页、注入广告、读浏览记录。\n"
+                    "%s") % ("\n".join(lines),
+                            "这台电脑是单位管理的，多半是管理员部署的，不建议动。" if managed else
+                            ("处理：清除来源不明的登记项（整个键已备份，可还原）。清除后浏览器通常会在下次启动时把对应扩展一并移除；"
+                             "商店来源的只提示，不动。")),
+            fix=fix, default=False)
+
+
 def _hijack_findings(d, add):
     if not d:
         return
-    for fn in (_proxy_findings, _policy_findings, _ie_findings, _hosts_findings, _lnk_findings):
+    for fn in (_proxy_findings, _policy_findings, _ie_findings, _hosts_findings, _lnk_findings,
+               _ext_findings):
         try:
             fn(d, add)
         except Exception as e:
@@ -6436,6 +6542,12 @@ def make_backup(findings, backup_root=None, tag=""):
                 snap["items"].append({"id": rid, "kind": "reg_edit", "hive": hv,
                                       "subkey": it["subkey"], "name": it["name"],
                                       "existed": val is not None, "value": val, "valuetype": typ})
+        elif t == "reg_key_delete":
+            for it in fx["items"]:
+                hv = it.get("hive", "HKCU")
+                snap["items"].append({"id": rid, "kind": "reg_key", "hive": hv, "subkey": it["subkey"],
+                                      "name": it["subkey"].rsplit("\\", 1)[-1],
+                                      "dump": _dump_key_tree(_root_of(hv), it["subkey"])})
         elif t == "defender_pua":
             snap["items"].append({"id": rid, "kind": "defender_pua", "name": "PUAProtection",
                                   "old": _read_pua()})
@@ -6514,6 +6626,7 @@ def make_backup_readme_text(snap):
         "rm_svc": "被删除的服务键", "task": "被禁用的计划任务",
         "delay_task_del": "被删除的计划任务",
         "hosts": "hosts 文件", "lnk_args": "被改过参数的快捷方式",
+        "reg_key": "被删除的浏览器扩展注册项",
     }
     reg_has = [v for k, v in reg_only.items() if k in kinds]
     need = [v for k, v in app_only.items() if k in kinds]
@@ -6730,6 +6843,50 @@ def _set_lnk_args(path, new_args, dry_run=False):
     if (info.get("args") or "") != (new_args or ""):
         return False, "改写后校验不一致：%s（参数现为 %r）" % (path, info.get("args"))
     return True, "已清掉快捷方式里多余的网址：%s" % path
+
+
+def _dump_key_tree(root, sub):
+    """把一个注册表键（含全部值和子键）导成可存 JSON 的结构；键不存在返回 None。"""
+    try:
+        k = winreg.OpenKey(root, sub, 0, winreg.KEY_READ)
+    except OSError:
+        return None
+    vals, subs = [], {}
+    with k:
+        n_sub, n_val, _t = winreg.QueryInfoKey(k)
+        for i in range(n_val):
+            vn, vd, vt = winreg.EnumValue(k, i)
+            if isinstance(vd, bytes):
+                vd = {"__b64__": base64.b64encode(vd).decode("ascii")}
+            vals.append([str(vn), int(vt), vd])
+        names = [winreg.EnumKey(k, i) for i in range(n_sub)]
+    for c in names:
+        subs[c] = _dump_key_tree(root, sub + "\\" + c)
+    return {"values": vals, "subkeys": subs}
+
+
+def _restore_key_tree(root, sub, dump):
+    with winreg.CreateKeyEx(root, sub, 0, winreg.KEY_SET_VALUE) as k:
+        for vn, vt, vd in dump.get("values") or []:
+            if isinstance(vd, dict) and "__b64__" in vd:
+                vd = base64.b64decode(vd["__b64__"])
+            winreg.SetValueEx(k, vn, 0, int(vt), vd)
+    for c, d in (dump.get("subkeys") or {}).items():
+        if d is not None:
+            _restore_key_tree(root, sub + "\\" + c, d)
+
+
+def _reg_key_delete_apply(it, dry_run=False):
+    desc = "%s\\%s" % (it.get("hive", "HKCU"), it.get("subkey", ""))
+    if dry_run:
+        return True, "[试运行] 删除注册表键：%s" % desc
+    try:
+        _delete_key_tree(_root_of(it.get("hive", "HKCU")), it["subkey"])
+        return True, "已删除：%s" % desc
+    except FileNotFoundError:
+        return True, "本来就不存在：%s" % desc
+    except OSError as e:
+        return False, "删除失败：%s（%s）" % (desc, e)
 
 
 def _read_pua():
@@ -7082,6 +7239,11 @@ def apply_fixes(findings, backup_dir, progress=None, dry_run=False):
                     ok, msg = _reg_edit_apply(it, dry_run)
                     res["msgs"].append(msg)
                     res["ok"] = res["ok"] and ok
+            elif t == "reg_key_delete":
+                for it in fx["items"]:
+                    ok, msg = _reg_key_delete_apply(it, dry_run)
+                    res["msgs"].append(msg)
+                    res["ok"] = res["ok"] and ok
             elif t == "defender_pua":
                 for it in fx["items"]:
                     ok, msg = _set_pua(it.get("value", 1), dry_run)
@@ -7271,6 +7433,19 @@ def restore_backup(backup_dir, progress=None, dry_run=False):
                 ok, msg = _reg_edit_restore(it, dry_run)
                 res["ok"] = ok
                 res["msgs"].append(msg)
+            elif k == "reg_key":
+                desc = "%s\\%s" % (it.get("hive"), it.get("subkey"))
+                if dry_run:
+                    res["msgs"].append("[试运行] 还原注册表键：%s" % desc)
+                elif it.get("dump") is None:
+                    res["msgs"].append("（备份时这个键就不存在，无需还原）：%s" % desc)
+                else:
+                    try:
+                        _restore_key_tree(_root_of(it.get("hive", "HKCU")), it["subkey"], it["dump"])
+                        res["msgs"].append("已还原：%s" % desc)
+                    except OSError as e:
+                        res["ok"] = False
+                        res["msgs"].append("还原失败：%s（%s）" % (desc, e))
             elif k == "defender_pua":
                 if it.get("old") is None:
                     res["msgs"].append("（快照里没有原值，请到 Windows 安全中心手动确认）")

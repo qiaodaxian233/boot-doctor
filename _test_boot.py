@@ -3216,5 +3216,126 @@ class TestProcWatchE2E(_GuardE2EBase):
         self.assertEqual(len(self._rows_for()), n0, "关了监控不该再有记录")
 
 
+class TestExtensionCheck(unittest.TestCase):
+    """被别的程序通过注册表登记进 Chrome / Edge 的扩展。"""
+    BASE = r"Software\BootDoctorUnitTest\Ext"
+    IDS = {k: ch * 32 for k, ch in (("store", "a"), ("bad", "b"), ("mid", "c"), ("crx", "d"),
+                                      ("gone", "e"), ("nested", "f"))}
+
+    def setUp(self):
+        import winreg
+        self.W = winreg
+        bc._delete_key_tree(winreg.HKEY_CURRENT_USER, r"Software\BootDoctorUnitTest")
+        self.td = tempfile.mkdtemp()
+        self.crx = os.path.join(self.td, "x.crx")
+        open(self.crx, "wb").write(b"Cr24")
+
+        def mk(name, **vals):
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, self.BASE + "\\" + name, 0, winreg.KEY_SET_VALUE) as k:
+                for vn, vv in vals.items():
+                    winreg.SetValueEx(k, vn, 0, winreg.REG_SZ, vv)
+        mk(self.IDS["store"], update_url="https://clients2.google.com/service/update2/crx")
+        mk(self.IDS["bad"], update_url="http://ext.bad.example/update.xml")
+        mk(self.IDS["mid"], update_url="https://cdn.example.org/u.xml")
+        mk(self.IDS["crx"], path=self.crx, version="1.0")
+        mk(self.IDS["gone"], path=os.path.join(self.td, "nope.crx"), version="1.0")
+        mk("not-an-extension-id", update_url="https://x")
+        mk(self.IDS["nested"], update_url="https://cdn.example.org/n.xml")
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, self.BASE + "\\" + self.IDS["nested"] + "\\sub", 0,
+                                winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, "blob", 0, winreg.REG_BINARY, b"\x00\x01\xfe")
+            winreg.SetValueEx(k, "n", 0, winreg.REG_DWORD, 7)
+        self.roots = [("Chrome", "HKCU", self.BASE)]
+
+    def tearDown(self):
+        bc._delete_key_tree(self.W.HKEY_CURRENT_USER, r"Software\BootDoctorUnitTest")
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _rows(self):
+        return {r["ext_id"]: r for r in bc.read_external_extensions(self.roots)}
+
+    def test_read_ignores_non_ids(self):
+        rows = self._rows()
+        self.assertEqual(set(rows), set(self.IDS.values()), "非 32 位 a-p 的键名不是扩展 ID，应忽略")
+        self.assertEqual(rows[self.IDS["crx"]]["path"], self.crx)
+        self.assertEqual(rows[self.IDS["crx"]]["version"], "1.0")
+        self.assertEqual(rows[self.IDS["bad"]]["browser"], "Chrome")
+
+    def test_verdicts(self):
+        r = self._rows()
+        a = lambda k: bc.analyze_extension(r[self.IDS[k]])      # noqa: E731
+        self.assertEqual((a("store")["sev"], a("store")["store"]), ("info", True))
+        self.assertEqual((a("bad")["sev"], a("bad")["store"]), ("high", False), "明文 http 应高危")
+        self.assertEqual(a("mid")["sev"], "mid")
+        self.assertEqual(a("crx")["sev"], "high", "本地 crx 在 Temp 下应高危")
+        self.assertEqual(a("gone")["sev"], "low")
+        self.assertEqual(bc.analyze_extension({"update_url": "https://1.2.3.4/u.xml"})["sev"], "high", "IP 地址")
+        self.assertEqual(bc.analyze_extension({"update_url": "https://edge.microsoft.com/extensionwebstorebase/v1/crx"})["sev"], "info")
+
+    def _findings(self, managed=False):
+        got = []
+        d = {"managed": managed, "extensions": list(self._rows().values())}
+        bc._ext_findings(d, lambda **kw: got.append(kw))
+        return got
+
+    def test_findings_group_and_fix_only_suspicious(self):
+        got = self._findings()
+        self.assertEqual(len(got), 1)
+        f = got[0]
+        self.assertEqual((f["id"], f["cat"], f["sev"]), ("hij_ext@Chrome", "浏览器劫持", "high"))
+        self.assertFalse(f["default"])
+        subs = {it["subkey"].rsplit("\\", 1)[-1] for it in f["fix"]["items"]}
+        self.assertNotIn(self.IDS["store"], subs, "商店来源的只提示，不该进清除清单")
+        self.assertIn(self.IDS["bad"], subs)
+        self.assertIn("reg_key_delete", bc.FIX_DESC)
+        m = self._findings(managed=True)[0]
+        self.assertEqual(m["sev"], "info")
+        self.assertIsNone(m["fix"], "受管理的电脑不建议动")
+
+    def test_key_delete_backup_apply_restore_incl_nested_and_binary(self):
+        W = self.W
+        items = [{"hive": "HKCU", "subkey": self.BASE + "\\" + self.IDS[k]} for k in ("nested", "bad")]
+        f = {"id": "x", "title": "x", "fix": {"type": "reg_key_delete", "risk": "confirm", "items": items}}
+
+        def exists(name):
+            try:
+                W.CloseKey(W.OpenKey(W.HKEY_CURRENT_USER, self.BASE + "\\" + name))
+                return True
+            except OSError:
+                return False
+        with tempfile.TemporaryDirectory() as td:
+            bdir = bc.make_backup([f], backup_root=td, tag="ut")
+            res = bc.apply_fixes([f], bdir)
+            self.assertTrue(all(r["ok"] for r in res), res)
+            self.assertFalse(exists(self.IDS["nested"]) or exists(self.IDS["bad"]), "键没删掉")
+            self.assertTrue(exists(self.IDS["store"]), "别的键不能动")
+            self.assertIn("被删除的浏览器扩展注册项", open(os.path.join(bdir, "说明.txt"), encoding="utf-8").read())
+            rr = bc.restore_backup(bdir)
+            self.assertTrue(all(r["ok"] for r in rr), rr)
+        self.assertTrue(exists(self.IDS["nested"]) and exists(self.IDS["bad"]))
+        with W.OpenKey(W.HKEY_CURRENT_USER, self.BASE + "\\" + self.IDS["nested"] + "\\sub") as k:
+            self.assertEqual(W.QueryValueEx(k, "blob"), (b"\x00\x01\xfe", W.REG_BINARY))
+            self.assertEqual(W.QueryValueEx(k, "n"), (7, W.REG_DWORD))
+        with W.OpenKey(W.HKEY_CURRENT_USER, self.BASE + "\\" + self.IDS["bad"]) as k:
+            self.assertEqual(W.QueryValueEx(k, "update_url")[0], "http://ext.bad.example/update.xml")
+
+    def test_missing_key_is_not_a_failure(self):
+        ok, msg = bc._reg_key_delete_apply({"hive": "HKCU", "subkey": self.BASE + r"\zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"})
+        self.assertTrue(ok, msg)
+
+    def test_real_machine_and_analyze_integration(self):
+        rows = bc.read_external_extensions()
+        self.assertIsInstance(rows, list)
+        d = bc.collect_hijack()
+        self.assertIsInstance(d["extensions"], list)
+        raw = fake_raw()
+        raw["hijack"] = {"managed": False, "proxy": {}, "policies": [], "ie": [], "lnks": [], "hosts": {},
+                         "extensions": list(self._rows().values())}
+        res = bc.analyze(raw)
+        f = next((x for x in res["findings"] if x["id"] == "hij_ext@Chrome"), None)
+        self.assertIsNotNone(f)
+        self.assertIn(f["fix"]["type"], bc.FIX_DESC)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
