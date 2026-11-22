@@ -2946,7 +2946,8 @@ class TestRunningProcessScan(unittest.TestCase):
                     break
                 _t.sleep(0.1)
             self.assertIsNotNone(self.child.poll(), "进程没被结束")
-            self.assertIn("proc_kill", open(os.path.join(bdir, "说明.txt"), encoding="utf-8").read())
+            self.assertIn("结束过运行中的进程", open(os.path.join(bdir, "说明.txt"), encoding="utf-8").read(),
+                          "备份说明里要如实写明进程无法还原")
             rr = bc.restore_backup(bdir)
             self.assertTrue(all(r["ok"] for r in rr), rr)
             self.assertIn("无法", " ".join(rr[0]["msgs"]))
