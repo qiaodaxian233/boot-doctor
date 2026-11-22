@@ -1886,6 +1886,7 @@ class TestLnkParser(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             lnk = os.path.join(td, "谷歌浏览器.lnk")
             _make_lnk(lnk, sys.executable, "--profile-directory=Default")
+            self.assertTrue(os.path.isfile(lnk), "夹具没造出文件，目录里是：%r" % (os.listdir(td),))
             old = bc.run_ps
             bc.run_ps = lambda *a, **k: (_ for _ in ()).throw(AssertionError("不该起 PowerShell"))
             bc._LNK_CACHE.pop(lnk, None)
