@@ -1189,6 +1189,28 @@ class TestPopupBlock(unittest.TestCase):
         self.assertTrue(bc._pid_alive(os.getpid()))
         self.assertFalse(bc._pid_alive(999999))
 
+    def test_user_rule_cannot_close_system_proc(self):
+        """用户规则也压不住系统进程：title=下载 不能把资源管理器里的「下载」文件夹关了。"""
+        r = self._rules(block=[{"kind": "title", "pattern": "下载"}])
+        win = {"proc": "explorer.exe", "cls": "CabinetWClass", "title": "下载",
+               "judge": "normal"}
+        ok, why = bc.should_close_popup(win, r)
+        self.assertFalse(ok)
+        self.assertEqual(why, "系统进程")
+
+    def test_guard_pid_rejects_reused_pid(self):
+        """pid 文件里的 PID 已被别的进程复用时不能认成守护，否则「停止」会误杀无关进程。"""
+        p = os.path.join(self._tmp, "guard.pid")
+        me = os.getpid()
+        with open(p, "w", encoding="utf-8") as fp:
+            fp.write("%d %d" % (me, 12345))              # PID 活着，但创建时间对不上
+        self.assertEqual(bc.guard_pid(p), 0)
+        bc.write_guard_pid(p)                             # 真实的 PID + 创建时间
+        self.assertEqual(bc.guard_pid(p), me)
+        with open(p, "w", encoding="utf-8") as fp:
+            fp.write(str(me))                             # 旧格式只有 PID：至少得是 Python 进程
+        self.assertEqual(bc.guard_pid(p), me)
+
     # ---------------- 后台运行 / 开机自启（v1.9.1） ----------------
     def test_autostart_roundtrip(self):
         """开机自启：写 Run 项 → 读回 → 删除；命令行必须是 pythonw + --silent。"""
