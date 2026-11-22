@@ -156,3 +156,12 @@ if isinstance(raw, dict):
         (time.perf_counter() - t) * 1000))
 _win.close()
 
+print("\n[新增采集的耗时]")
+t = time.perf_counter()
+_procs = bc.enum_processes()
+print("  enum_processes()  %d 个非系统进程            %7.0f ms" % (len(_procs), (time.perf_counter() - t) * 1000))
+t = time.perf_counter()
+_sd = bc.sys_info_native()
+print("  sys_info_native()（磁盘 + 安全防护，含 PowerShell）%7.0f ms" % ((time.perf_counter() - t) * 1000))
+print("  security = %r" % (_sd.get("security"),))
+
