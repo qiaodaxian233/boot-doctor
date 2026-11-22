@@ -41,3 +41,6 @@ _ui_live_*.png
 *.swp
 Thumbs.db
 desktop.ini
+
+# CI 截图输出
+_ci_shots/

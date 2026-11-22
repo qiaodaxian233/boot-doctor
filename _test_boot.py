@@ -290,7 +290,7 @@ class TestGuiOffscreen(unittest.TestCase):
         dlg = bd.PopupDialog()
         self.assertEqual(dlg.tree.columnCount(), 5)
         self.assertEqual(dlg.watch.columnCount(), 5)
-        self.assertEqual(dlg.tabs.count(), 2)
+        self.assertEqual(dlg.tabs.count(), 3)            # 当前窗口 / 窗口记录 / 自启变动
         self.assertTrue(dlg.btn_guard.text() in ("开始后台拦截", "停止后台拦截"))
         self.assertIn("守护：", dlg.lbl_guard.text())
         self.assertIn("开机自启", dlg.lbl_guard.text())
@@ -1532,6 +1532,298 @@ class TestEventsQuery(unittest.TestCase):
         self.assertEqual(nsl[:len(osl)], osl)
         self.assertEqual([x.get("msg") for x in _as_list(new.get("scm"))],
                          [x.get("msg") for x in _as_list(old.get("scm"))])
+
+
+class TestNotify(unittest.TestCase):
+    """通知管理：在一个临时注册表位置上真读真写，不碰真实的通知设置。"""
+    ROOT = r"Software\BootDoctorUnitTest\Notifications\Settings"
+    NESTED = r"{6D809377-6AF0-444B-8957-A3773F02200E}\UnitTestVendor\ut_app.exe"
+
+    def setUp(self):
+        import winreg
+        self.wr = winreg
+        bc._delete_key_tree(winreg.HKEY_CURRENT_USER, r"Software\BootDoctorUnitTest")
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, self.ROOT + r"\UnitTest.PlainApp") as k:
+            winreg.SetValueEx(k, "LastNotificationAddedTime", 0, winreg.REG_QWORD,
+                              133500000000000000)
+        # 应用 ID 带反斜杠时，注册表里是多级子键，只有最里层有值
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, self.ROOT + "\\" + self.NESTED) as k:
+            winreg.SetValueEx(k, "LastNotificationAddedTime", 0, winreg.REG_QWORD,
+                              133600000000000000)
+
+    def tearDown(self):
+        bc._delete_key_tree(self.wr.HKEY_CURRENT_USER, r"Software\BootDoctorUnitTest")
+
+    def _by_id(self):
+        return {a["aumid"]: a for a in bc.list_notify_apps(self.ROOT)}
+
+    def test_list_nested_and_plain(self):
+        apps = self._by_id()
+        self.assertEqual(set(apps), {"UnitTest.PlainApp", self.NESTED},
+                         "多级子键没有拼回完整的应用 ID，或者把中间层当成了应用")
+        nested = apps[self.NESTED]
+        self.assertTrue(nested["path"].lower().endswith(r"unittestvendor\ut_app.exe"), nested["path"])
+        self.assertTrue(nested["enabled"], "没写 Enabled 的应用默认是允许通知")
+        self.assertTrue(nested["last"].startswith("20"), nested["last"])
+        ids = [a["aumid"] for a in bc.list_notify_apps(self.ROOT)]
+        self.assertEqual(ids[0], self.NESTED, "应按最近一次通知时间倒序")
+
+    def test_toggle_roundtrip(self):
+        ok, msg = bc.set_notify_enabled(self.NESTED, False, self.ROOT)
+        self.assertTrue(ok, msg)
+        self.assertFalse(self._by_id()[self.NESTED]["enabled"])
+        self.assertTrue(self._by_id()["UnitTest.PlainApp"]["enabled"], "关一个不能影响别的")
+        ok, msg = bc.set_notify_enabled(self.NESTED, True, self.ROOT)
+        self.assertTrue(ok, msg)
+        self.assertTrue(self._by_id()[self.NESTED]["enabled"])
+
+    def test_page_toggles_selected(self):
+        from PyQt5.QtWidgets import QApplication
+        import boot_doctor as bd
+        app = QApplication.instance() or QApplication([])  # noqa: F841
+        page = bd.NotifyPage(root_sub=self.ROOT)
+        self.assertEqual(page.tree.topLevelItemCount(), 2)
+        page.tree.topLevelItem(0).setSelected(True)
+        page.set_selected(False)
+        self.assertEqual(page.stats()["on"], 1)
+        page.close()
+
+
+class TestNavPages(unittest.TestCase):
+    """左侧导航：每页都能打开，弹窗页是嵌进来的（不是弹出窗口），过滤控件只在体检页显示。"""
+
+    def test_pages(self):
+        from PyQt5.QtWidgets import QApplication
+        import boot_doctor as bd
+        app = QApplication.instance() or QApplication([])
+        win = bd.MainWindow(autoscan=False)
+        win.show()
+        try:
+            self.assertEqual(win.nav.count(), 4)
+            self.assertNotIn("popup", win._page_built, "弹窗页应在第一次打开时才建（启动不枚举窗口）")
+            for key in ("popup", "notify", "backup", "scan"):
+                win.show_page(key)
+                app.processEvents()
+                self.assertEqual(win.current_page(), key)
+                self.assertIs(win.pages.currentWidget(), win.page_widget(key))
+                for act in win._scan_only_acts:
+                    self.assertEqual(act.isVisible(), key == "scan",
+                                     "%s 页上体检过滤控件的显示状态不对" % key)
+            pop = win.page_widget("popup")
+            self.assertIsInstance(pop, bd.PopupDialog)
+            self.assertFalse(pop.isWindow(), "弹窗拦截页应嵌在主窗口里，不是独立窗口")
+            win.on_popup_dialog()              # 菜单入口：跳页，不再弹模态框
+            self.assertEqual(win.current_page(), "popup")
+        finally:
+            win.close()
+
+    def test_badges_after_scan(self):
+        from PyQt5.QtWidgets import QApplication
+        import boot_doctor as bd
+        app = QApplication.instance() or QApplication([])  # noqa: F841
+        win = bd.MainWindow(autoscan=False)
+        try:
+            raw = fake_raw()
+            res = bc.analyze(raw)
+            win.on_scan_done(raw, res)
+            self.assertIn(str(res["score"]), win.nav.item(0).text())
+        finally:
+            win.close()
+
+    def test_backup_page_lists(self):
+        from PyQt5.QtWidgets import QApplication
+        import boot_doctor as bd
+        app = QApplication.instance() or QApplication([])  # noqa: F841
+        old = bc.BACKUP_DIR
+        with tempfile.TemporaryDirectory() as td:
+            bc.BACKUP_DIR = td
+            try:
+                fs = [{"id": "t1", "title": "T1", "fix": {"type": "svc_start", "risk": "safe",
+                                                         "items": {"luafv": 3}}}]
+                bc.make_backup(fs, backup_root=td, tag="ut")
+                win = bd.MainWindow(autoscan=False)
+                try:
+                    page = win.page_widget("backup")
+                    self.assertEqual(page.tree.topLevelItemCount(), 1)
+                    self.assertTrue(page.btn_restore.isEnabled())
+                    self.assertIn("1", win.nav.item(3).text())
+                finally:
+                    win.close()
+            finally:
+                bc.BACKUP_DIR = old
+
+
+class TestAutostartWatch(unittest.TestCase):
+    """新增自启监控。测试写的 Run 值指向一个不存在的路径：万一测试中途崩了没删掉，登录时也只是静默失败。"""
+    NAME = "BootDoctorUnitTestProbe"
+    CMD = r'"C:\BootDoctorUnitTest\not_exist.exe" --probe'
+    RUN = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+    def _set(self, cmd):
+        import winreg
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, self.RUN, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, self.NAME, 0, winreg.REG_SZ, cmd)
+
+    def tearDown(self):
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.RUN, 0, winreg.KEY_SET_VALUE) as k:
+                winreg.DeleteValue(k, self.NAME)
+        except OSError:
+            pass
+
+    def test_diff_logic(self):
+        old = {"a": {"name": "A", "cmd": "a.exe", "enabled": True, "kind": "run"},
+               "b": {"name": "B", "cmd": "b.exe", "enabled": False, "kind": "run"},
+               "c": {"name": "C", "cmd": "c.exe", "enabled": True, "kind": "run"}}
+        new = {"a": {"name": "A", "cmd": "a.exe", "enabled": True, "kind": "run"},
+               "b": {"name": "B", "cmd": "b.exe", "enabled": True, "kind": "run"},
+               "c": {"name": "C", "cmd": "evil.exe", "enabled": True, "kind": "run"},
+               "d": {"name": "D", "cmd": "d.exe", "enabled": True, "kind": "run"}}
+        got = {r["key"]: r["change"] for r in bc.autostart_diff(old, new)}
+        self.assertEqual(got, {"b": "reenabled", "c": "changed", "d": "added"})
+        self.assertEqual(bc.autostart_diff(new, old) and
+                         {r["key"] for r in bc.autostart_diff(new, old)}, {"c"},
+                         "删除不报，只报命令变化")
+
+    def test_own_entries_ignored(self):
+        self.assertTrue(bc._OWN_AUTOSTART.search("BootDoctorPopupGuard"))
+        self.assertTrue(bc._OWN_AUTOSTART.search(r"\BootDoctor-Delay-QQ"))
+        self.assertFalse(bc._OWN_AUTOSTART.search("BootDoctorPopupGuardX"))
+
+    def test_snapshot_and_diff_real_registry(self):
+        before = bc.autostart_snapshot(with_tasks=False)
+        self._set(self.CMD)
+        after = bc.autostart_snapshot(with_tasks=False)
+        rows = [r for r in bc.autostart_diff(before, after) if r["name"] == self.NAME]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["change"], "added")
+        self._set(self.CMD + " --changed")
+        again = bc.autostart_snapshot(with_tasks=False)
+        rows = [r for r in bc.autostart_diff(after, again) if r["name"] == self.NAME]
+        self.assertEqual([r["change"] for r in rows], ["changed"])
+
+    def test_watcher_wakes_on_registry_change(self):
+        import time as _t
+        w = bc.AutostartWatcher(watch_tasks=False)
+        self.assertTrue(w.start(), "一个位置都没盯上")
+        try:
+            self.assertTrue(any(x.endswith(self.RUN) for x in w.watching), w.watching)
+            self.assertEqual(w.dirty_at, 0.0)
+            self._set(self.CMD)
+            end = _t.time() + 5
+            while not w.dirty_at and _t.time() < end:
+                _t.sleep(0.05)
+            self.assertTrue(w.dirty_at, "写了 Run 键，监控线程 5 秒内没收到通知")
+            # 通知是一次性的：要能连续收到第二次
+            w.dirty_at = 0.0
+            self._set(self.CMD + " --again")
+            end = _t.time() + 5
+            while not w.dirty_at and _t.time() < end:
+                _t.sleep(0.05)
+            self.assertTrue(w.dirty_at, "第二次变化没收到：触发后没重新挂通知")
+        finally:
+            w.stop()
+
+    def test_describe_change(self):
+        np = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "notepad.exe")
+        r = bc.describe_autostart_change({"name": "x", "cmd": '"%s" a.txt' % np,
+                                          "kind": "run", "change": "added"})
+        self.assertEqual(os.path.normcase(r["path"]), os.path.normcase(np))
+        self.assertIn("Microsoft", r["company"])
+        self.assertEqual(r["adware"], "")
+        self.assertTrue(r["t"].startswith("20"))
+
+    def test_page_tab_and_jump(self):
+        from PyQt5.QtWidgets import QApplication
+        import boot_doctor as bd
+        app = QApplication.instance() or QApplication([])  # noqa: F841
+        old = bc.AUTOSTART_WATCH_LOG
+        with tempfile.TemporaryDirectory() as td:
+            bc.AUTOSTART_WATCH_LOG = os.path.join(td, "w.log")
+            bc.append_autostart_watch([{"t": "2026-11-22 10:00:00", "change": "added",
+                                        "name": "SomeUpdater", "source": "用户 Run",
+                                        "cmd": "x.exe", "adware": "2345 全家桶"}])
+            win = bd.MainWindow(autoscan=False)
+            win.start_scan = lambda: None                 # 别真去体检
+            try:
+                win.show_page("popup")
+                pg = win.page_widget("popup")
+                pg.tabs.setCurrentIndex(2)
+                self.assertEqual(pg.as_tree.topLevelItemCount(), 1)
+                self.assertIn("(1)", pg.tabs.tabText(2))
+                pg.as_tree.setCurrentItem(pg.as_tree.topLevelItem(0))
+                pg.on_handle_autostart()
+                self.assertEqual(win.current_page(), "scan")
+                self.assertEqual(win.ed_search.text(), "SomeUpdater")
+            finally:
+                win.close()
+                bc.AUTOSTART_WATCH_LOG = old
+
+
+class TestThirdPartyTasks(unittest.TestCase):
+    """第三方开机/登录计划任务：能列出、能禁止、能恢复。真注册一个测试任务（指向不存在的程序）。"""
+    TP = "\\BootDoctorUnitTest\\"
+    TN = "Probe"
+    EXE = r"C:\BootDoctorUnitTest\not_exist.exe"
+
+    def test_split_task_path(self):
+        self.assertEqual(bc.split_task_path(r"\Vendor\Sub\Task"), ("\\Vendor\\Sub\\", "Task"))
+        self.assertEqual(bc.split_task_path(r"\RootTask"), ("\\", "RootTask"))
+        self.assertEqual(bc.split_task_path("BootDoctor-Delay-X"), ("\\", "BootDoctor-Delay-X"))
+
+    def _ps(self, script):
+        env = dict(os.environ, BD_TPATH=self.TP, BD_TASK=self.TN, BD_EXE=self.EXE)
+        return bc.run_ps(script, timeout=90, env=env)
+
+    def setUp(self):
+        if not bc.is_admin():
+            self.skipTest("读 System32\\Tasks 需要管理员")
+        out = self._ps("Register-ScheduledTask -TaskName $env:BD_TASK -TaskPath $env:BD_TPATH "
+                       "-Action (New-ScheduledTaskAction -Execute $env:BD_EXE -Argument '--probe') "
+                       "-Trigger (New-ScheduledTaskTrigger -AtLogOn) -Force | Out-Null; 'OK'")
+        self.assertIn("OK", out, "注册测试任务失败")
+
+    def tearDown(self):
+        self._ps("Unregister-ScheduledTask -TaskName $env:BD_TASK -TaskPath $env:BD_TPATH "
+                 "-Confirm:$false -ErrorAction SilentlyContinue")
+
+    def test_list_analyze_disable_enable(self):
+        full = self.TP + self.TN
+        self.assertIn(full, bc.boot_logon_tasks_from_xml())
+        self.assertEqual(bc._task_command(full), self.EXE + " --probe")
+        raw = fake_raw()
+        raw["sys"]["tasks"] = [full, r"\Microsoft\Windows\Something\Ms"]
+        res = bc.analyze(raw)
+        f = next((x for x in res["findings"] if x["id"] == "task_item@" + full), None)
+        self.assertIsNotNone(f, "第三方开机任务没出现在体检结果里")
+        self.assertEqual(f["cat"], "开机自启")
+        self.assertEqual(set(f["opts"]), {"block"})
+        self.assertEqual(f["fix"], {"type": "task_off", "risk": "safe", "items": [full]})
+        self.assertFalse(any(x["id"].startswith("task_item@\\Microsoft") for x in res["findings"]),
+                         "微软自家任务不该列出来")
+
+        ok, msg = bc._set_task_enabled(full, False)
+        self.assertTrue(ok, msg)
+        self.assertNotIn(full, bc.boot_logon_tasks_from_xml(), "禁止后还在开机任务列表里")
+        ok, msg = bc._set_task_enabled(full, True)
+        self.assertTrue(ok, msg)
+        self.assertIn(full, bc.boot_logon_tasks_from_xml())
+
+    def test_backup_restore_roundtrip(self):
+        """走完整的 备份 → 执行 → 还原 流程，和界面上点「智能优化」「还原」一样。"""
+        full = self.TP + self.TN
+        f = {"id": "task_item@" + full, "title": "t",
+             "fix": {"type": "task_off", "risk": "safe", "items": [full]}}
+        with tempfile.TemporaryDirectory() as td:
+            bdir = bc.make_backup([f], backup_root=td, tag="ut")
+            res = bc.apply_fixes([f], bdir)
+            self.assertTrue(all(r.get("ok", True) for r in (res if isinstance(res, list) else [res])),
+                            res)
+            self.assertNotIn(full, bc.boot_logon_tasks_from_xml())
+            rr = bc.restore_backup(bdir)
+            self.assertTrue(rr, "还原没有返回结果")
+            self.assertIn(full, bc.boot_logon_tasks_from_xml(), "还原后任务没有重新启用")
 
 
 class TestLauncher(unittest.TestCase):

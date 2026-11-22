@@ -18,6 +18,7 @@
 import ctypes
 import ctypes.wintypes as wt
 import os
+import subprocess
 import sys
 import time
 
@@ -131,6 +132,9 @@ class Guard(QApplication):
         self.act_log = QAction("打开拦截日志", self)
         self.act_log.triggered.connect(self.open_log)
         self.menu.addAction(self.act_log)
+        self.act_open_app = QAction("打开开机体检大师", self)
+        self.act_open_app.triggered.connect(lambda: self.open_main("popup"))
+        self.menu.addAction(self.act_open_app)
         self.act_rules = QAction("打开规则文件", self)
         self.act_rules.triggered.connect(self.open_rules)
         self.menu.addAction(self.act_rules)
@@ -162,6 +166,16 @@ class Guard(QApplication):
         self.stop_timer.timeout.connect(self.check_stop)
         self.stop_timer.start(500)
         self.aboutToQuit.connect(self.cleanup)   # 注销 / 关机时也会触发
+        self.tray.messageClicked.connect(lambda: self.open_main("popup"))
+
+        # 新增自启监控：和弹窗拦截共用这个常驻进程，不再多开一个
+        self.as_watch = None
+        self.as_snap = None
+        self.as_timer = QTimer(self)
+        self.as_timer.timeout.connect(self.check_autostart)
+        self.as_full_at = 0.0
+        if self.rules.get("watch_autostart", True):
+            self.start_autostart_watch()
 
         try:
             bc.write_guard_pid()
@@ -175,6 +189,85 @@ class Guard(QApplication):
         if not bc.is_admin():
             glog("提示：守护以普通权限运行，以管理员身份运行的程序弹出的窗口关不掉（UIPI 限制）")
         self.tick(force=True)
+
+    # ---------------- 新增自启监控 ----------------
+    def start_autostart_watch(self):
+        try:
+            self.as_snap = bc.autostart_snapshot()
+            base = bc.load_autostart_baseline()
+            if base is not None:
+                # 守护没运行的这段时间（比如关机期间装了软件）发生的变化，补报一次
+                self.report_autostart(bc.autostart_diff(base, self.as_snap), offline=True)
+            bc.save_autostart_baseline(self.as_snap)
+            self.as_watch = bc.AutostartWatcher(watch_tasks=bc.is_admin())
+            self.as_watch.start()
+            self.as_full_at = time.time()
+            self.as_timer.start(1000)
+            glog("自启监控已启动，盯住 %d 处：%s" % (len(self.as_watch.watching),
+                                              "；".join(self.as_watch.watching)))
+        except Exception as e:
+            glog("自启监控启动失败：%r" % (e,))
+            self.as_watch = None
+
+    def check_autostart(self):
+        w = self.as_watch
+        if not w or self.as_snap is None:
+            return
+        now = time.time()
+        # 安装程序往往连写好几个值：最后一次变化后静默 1.5 秒再对比，免得一次安装报好几回。
+        # 另外每 10 分钟无条件对比一次，防止哪次通知漏了
+        due = (w.dirty_at and now - w.dirty_at > 1.5) or now - self.as_full_at > 600
+        if not due:
+            return
+        w.dirty_at = 0.0
+        self.as_full_at = now
+        try:
+            new = bc.autostart_snapshot(with_tasks=bc.is_admin())
+        except Exception as e:
+            glog("自启快照失败：%r" % (e,))
+            return
+        rows = bc.autostart_diff(self.as_snap, new)
+        self.as_snap = new
+        bc.save_autostart_baseline(new)
+        self.report_autostart(rows)
+
+    def report_autostart(self, rows, offline=False):
+        if not rows:
+            return
+        rows = [bc.describe_autostart_change(r) for r in rows]
+        bc.append_autostart_watch(rows)
+        for r in rows:
+            glog("自启%s「%s」 来源=%s 命令=%s%s" % (
+                bc.AUTOSTART_CHANGE_CN.get(r["change"], r["change"]), r.get("name"),
+                r.get("source"), (r.get("cmd") or "")[:160],
+                ("  特征库：" + r["adware"]) if r.get("adware") else ""))
+        if len(rows) == 1:
+            r = rows[0]
+            title = "开机启动%s：%s" % (bc.AUTOSTART_CHANGE_CN.get(r["change"], ""), r.get("name"))
+            msg = "%s\n%s" % (r.get("source") or "", (r.get("cmd") or "")[:120])
+            if r.get("adware"):
+                msg += "\n命中流氓软件特征库：%s" % r["adware"]
+        else:
+            title = "%s有 %d 项开机启动变化" % ("关机期间" if offline else "", len(rows))
+            msg = "、".join((r.get("name") or "")[:20] for r in rows[:5])
+            if len(rows) > 5:
+                msg += " 等"
+        msg += "\n点这里查看和处理"
+        icon = QSystemTrayIcon.Warning if any(r.get("adware") for r in rows) \
+            else QSystemTrayIcon.Information
+        try:
+            self.tray.showMessage(title, msg, icon, 10000)
+        except Exception:
+            pass
+
+    def open_main(self, page="popup"):
+        """拉起主程序并跳到某一页（主程序自己会请求管理员权限）。"""
+        try:
+            exe = bc._pythonw_path()
+            subprocess.Popen([exe, os.path.join(HERE, "boot_doctor.py"), "--page=" + page],
+                             cwd=HERE, creationflags=0x08000000)
+        except Exception as e:
+            glog("打开主程序失败：%r" % (e,))
 
     # ---------------- 事件钩子 ----------------
     def install_hook(self):
@@ -291,6 +384,12 @@ class Guard(QApplication):
         self.quit()
 
     def cleanup(self):
+        if getattr(self, "as_watch", None):
+            try:
+                self.as_watch.stop()
+            except Exception:
+                pass
+            self.as_watch = None
         if self._hook:
             try:
                 _u32.UnhookWinEvent(self._hook)

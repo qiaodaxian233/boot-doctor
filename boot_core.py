@@ -1690,6 +1690,7 @@ DEFAULT_POPUP_RULES = {
     "enabled": False,
     "auto_adware": True,      # 自动关闭命中流氓软件特征库的弹窗
     "poll_ms": 1200,
+    "watch_autostart": True,  # 守护顺带盯开机自启的新增 / 重新启用 / 命令被改
     "block": [],              # [{"kind": "proc|path|title|class", "pattern": "...", "note": ""}]
     "allow": [],
 }
@@ -1702,7 +1703,7 @@ def load_popup_rules(path=None):
         with open(p, "r", encoding="utf-8") as fp:
             raw = json.load(fp)
         if isinstance(raw, dict):
-            for k in ("enabled", "auto_adware", "poll_ms"):
+            for k in ("enabled", "auto_adware", "poll_ms", "watch_autostart"):
                 if k in raw:
                     d[k] = raw[k]
             for k in ("block", "allow"):
@@ -2129,6 +2130,431 @@ def popup_log_tail(n=40):
         return [x.rstrip() for x in lines[-int(n):]]
     except Exception:
         return []
+
+
+# --------------------------------------------------------------------------
+# 新增自启监控：有软件偷偷加开机启动 / 把你禁用的又打开 / 改了启动命令，马上知道。
+#
+# 不轮询：RegNotifyChangeKeyValue 盯 Run 系列键和 StartupApproved，
+# FindFirstChangeNotification 盯两个启动文件夹和 System32\Tasks。有变化才重新拍一次快照做对比。
+# 快照存在 _logs\autostart_baseline.json，守护没运行期间的变化下次启动时也能补报。
+# --------------------------------------------------------------------------
+AUTOSTART_BASELINE = os.path.join(LOG_DIR, "autostart_baseline.json")
+AUTOSTART_WATCH_LOG = os.path.join(LOG_DIR, "autostart_watch.log")
+_OWN_AUTOSTART = re.compile(r"(^|\\)(BootDoctorPopupGuard|BootDoctor-Delay-[^\\]*)$", re.I)
+AUTOSTART_CHANGE_CN = {"added": "新增", "reenabled": "被重新启用", "changed": "启动命令被修改"}
+
+
+def _task_command(task_path):
+    """计划任务「\\路径\\名称」→ 它要运行的命令行（读 XML，读不到返回 ''）。"""
+    try:
+        txt = _task_xml_text(os.path.join(TASKS_DIR, task_path.lstrip("\\")))
+    except OSError:
+        return ""
+    m_cmd = re.search(r"<Command>([^<]*)</Command>", txt)
+    m_arg = re.search(r"<Arguments>([^<]*)</Arguments>", txt)
+    cmd = (m_cmd.group(1) if m_cmd else "").strip()
+    if m_arg and m_arg.group(1).strip():
+        cmd += " " + m_arg.group(1).strip()
+    return cmd
+
+
+def autostart_snapshot(with_tasks=True):
+    """当前所有开机自启：{键: {name, cmd, source, kind, hive, enabled}}。本工具自己的条目不算。"""
+    snap = {}
+    for it in enum_startup_items():
+        name = it.get("name") or ""
+        if _OWN_AUTOSTART.search(name):
+            continue
+        key = "%s|%s|%s|%s" % (it.get("kind"), it.get("hive"), it.get("subkey") or it.get("source"), name)
+        snap[key] = {"name": name, "cmd": it.get("cmd") or "", "source": it.get("source") or "",
+                     "kind": it.get("kind") or "", "hive": it.get("hive") or "",
+                     "enabled": bool(it.get("enabled", True))}
+    if with_tasks:
+        try:
+            tasks = boot_logon_tasks_from_xml()
+        except OSError:
+            tasks = None                                # 普通权限读不了任务目录：这一类不比
+        for t in tasks or []:
+            if _OWN_AUTOSTART.search(t):
+                continue
+            snap["task|" + t] = {"name": t.rsplit("\\", 1)[-1], "cmd": t,
+                                 "source": "计划任务（开机/登录触发）", "kind": "task",
+                                 "hive": "", "enabled": True}
+    return snap
+
+
+def autostart_diff(old, new):
+    """对比两次快照，返回变化列表（每项带 change: added / reenabled / changed）。
+
+    「删除」不报：用户自己清理、软件卸载都会删，报出来只是噪音。
+    """
+    out = []
+    for k, v in (new or {}).items():
+        o = (old or {}).get(k)
+        if o is None:
+            ch = "added"
+        elif v.get("enabled") and not o.get("enabled"):
+            ch = "reenabled"
+        elif v.get("kind") != "task" and (o.get("cmd") or "") != (v.get("cmd") or ""):
+            ch = "changed"
+        else:
+            continue
+        row = dict(v, key=k, change=ch)
+        if ch == "changed":
+            row["old_cmd"] = o.get("cmd") or ""
+        out.append(row)
+    return out
+
+
+def describe_autostart_change(row):
+    """给变化补上「这是哪个程序 / 是不是流氓软件」，供提醒和记录用。"""
+    cmd = row.get("cmd") or ""
+    if row.get("kind") == "task" and cmd.startswith("\\"):
+        cmd = _task_command(cmd) or cmd
+    exe, _args = split_cmdline(cmd) if cmd else ("", "")
+    path = resolve_image_path(exe) if exe else ""
+    company = _ver_company(path) if path and os.path.isfile(path) else ""
+    hit = adware_check(path=path or exe, name=row.get("name") or "", company=company, cmd=cmd)
+    return dict(row, cmd=cmd, path=path, company=company,
+                adware=hit.get("label", "") if hit.get("hit") else "",
+                t=_dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+
+def load_autostart_baseline(path=None):
+    try:
+        with open(path or AUTOSTART_BASELINE, "r", encoding="utf-8") as fp:
+            d = json.load(fp)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def save_autostart_baseline(snap, path=None):
+    try:
+        ensure_dirs()
+        _atomic_write_json(path or AUTOSTART_BASELINE, snap)
+    except Exception as e:
+        log_line("save autostart baseline failed: %r" % (e,))
+
+
+def append_autostart_watch(rows, path=None):
+    if not rows:
+        return
+    p = path or AUTOSTART_WATCH_LOG
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "a", encoding="utf-8") as fp:
+            for r in rows:
+                fp.write(json.dumps(r, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log_line("append autostart watch failed: %r" % (e,))
+
+
+def autostart_watch_log(limit=200, path=None):
+    """新增自启记录，最新在前。"""
+    out = []
+    try:
+        with open(path or AUTOSTART_WATCH_LOG, "r", encoding="utf-8", errors="replace") as fp:
+            for line in fp:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except Exception:
+                        pass
+    except Exception:
+        return []
+    return out[-int(limit):][::-1]
+
+
+class AutostartWatcher(object):
+    """后台线程等系统的变更通知，有变化就把 dirty_at 设成当前时间（由调用方去做快照对比）。
+
+    不用 Qt：守护和测试都能用。所有 RegNotifyChangeKeyValue 都在同一个线程里调——
+    这个 API 的通知挂在调用线程上，线程退出通知就失效。
+    """
+    _REG_WATCH = (
+        (HKCU, r"Software\Microsoft\Windows\CurrentVersion\Run", False),
+        (HKCU, r"Software\Microsoft\Windows\CurrentVersion\RunOnce", False),
+        (HKLM, r"Software\Microsoft\Windows\CurrentVersion\Run", False),
+        (HKLM, r"Software\Microsoft\Windows\CurrentVersion\RunOnce", False),
+        (HKLM, r"Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run", False),
+        (HKCU, _APPROVED_BASE, True),                   # 「禁用」标记被改回启用
+        (HKLM, _APPROVED_BASE, True),
+    )
+
+    def __init__(self, watch_tasks=True):
+        self.dirty_at = 0.0
+        self.watching = []                              # 实际盯上的位置（给界面 / 日志看）
+        self._watch_tasks = watch_tasks
+        self._thread = None
+        self._ready = threading.Event()
+        self._k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._adv = ctypes.WinDLL("advapi32", use_last_error=True)
+        k, a = self._k32, self._adv
+        k.CreateEventW.restype = ctypes.c_void_p
+        k.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]
+        k.SetEvent.argtypes = [ctypes.c_void_p]
+        k.CloseHandle.argtypes = [ctypes.c_void_p]
+        k.WaitForMultipleObjects.restype = ctypes.c_ulong
+        k.WaitForMultipleObjects.argtypes = [ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p),
+                                             ctypes.c_int, ctypes.c_ulong]
+        k.FindFirstChangeNotificationW.restype = ctypes.c_void_p
+        k.FindFirstChangeNotificationW.argtypes = [ctypes.c_wchar_p, ctypes.c_int, ctypes.c_ulong]
+        k.FindNextChangeNotification.argtypes = [ctypes.c_void_p]
+        k.FindCloseChangeNotification.argtypes = [ctypes.c_void_p]
+        a.RegNotifyChangeKeyValue.restype = ctypes.c_long
+        a.RegNotifyChangeKeyValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ulong,
+                                              ctypes.c_void_p, ctypes.c_int]
+        self._stop = k.CreateEventW(None, True, False, None)
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, name="autostart-watch", daemon=True)
+        self._thread.start()
+        self._ready.wait(5)
+        return bool(self.watching)
+
+    def stop(self):
+        if self._stop:
+            self._k32.SetEvent(self._stop)
+        if self._thread:
+            self._thread.join(3)
+
+    def _arm_reg(self, hkey, subtree, ev):
+        flt = 0x1 | 0x4                                 # REG_NOTIFY_CHANGE_NAME | LAST_SET
+        return self._adv.RegNotifyChangeKeyValue(hkey.handle, subtree, flt, ev, True) == 0
+
+    def _run(self):
+        k = self._k32
+        regs, dirs = [], []                              # (PyHKEY, subtree, event) / handle
+        try:
+            for root, sub, subtree in self._REG_WATCH:
+                try:
+                    hk = winreg.OpenKey(root, sub, 0, winreg.KEY_NOTIFY | winreg.KEY_READ)
+                except OSError:
+                    continue
+                ev = k.CreateEventW(None, False, False, None)
+                if ev and self._arm_reg(hk, subtree, ev):
+                    regs.append((hk, subtree, ev))
+                    self.watching.append(("HKCU\\" if root == HKCU else "HKLM\\") + sub)
+                else:
+                    hk.Close()
+            folders = [
+                os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Startup"),
+                os.path.join(os.environ.get("ProgramData", ""), r"Microsoft\Windows\Start Menu\Programs\Startup"),
+            ]
+            if self._watch_tasks:
+                folders.append(TASKS_DIR)
+            for d in folders:
+                if not os.path.isdir(d):
+                    continue
+                h = k.FindFirstChangeNotificationW(d, d == TASKS_DIR, 0x1 | 0x10)  # 文件名 / 写入
+                if h and h != ctypes.c_void_p(-1).value:
+                    dirs.append(h)
+                    self.watching.append(d)
+        finally:
+            self._ready.set()
+        handles = [self._stop] + [ev for _hk, _st, ev in regs] + dirs
+        arr = (ctypes.c_void_p * len(handles))(*handles)
+        try:
+            while True:
+                rc = k.WaitForMultipleObjects(len(handles), arr, False, 0xFFFFFFFF)
+                if rc == 0 or rc >= len(handles):        # 停止，或 WAIT_FAILED
+                    break
+                i = rc - 1
+                if i < len(regs):
+                    hk, st, ev = regs[i]
+                    self._arm_reg(hk, st, ev)            # 通知是一次性的，触发后要重新挂
+                else:
+                    k.FindNextChangeNotification(dirs[i - len(regs)])
+                self.dirty_at = time.time()
+        finally:
+            for hk, _st, ev in regs:
+                k.CloseHandle(ev)
+                hk.Close()
+            for h in dirs:
+                k.FindCloseChangeNotification(h)
+            k.CloseHandle(self._stop)
+            self._stop = None
+
+
+# --------------------------------------------------------------------------
+# 通知管理：右下角的系统通知（Toast）不是独立窗口，弹窗守护拦不到。
+# 但 Windows 允许按应用关掉：HKCU\...\Notifications\Settings\<应用 ID> 下 Enabled=0，
+# 和「设置 → 系统 → 通知」里关掉某个应用是同一个开关。
+# --------------------------------------------------------------------------
+NOTIFY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Notifications\Settings"
+
+# 应用 ID 里常见的已知文件夹 GUID（Win32 程序没自报 ID 时，系统用「已知文件夹 + 相对路径」当 ID）
+_KNOWN_FOLDER_ENV = {
+    "{6D809377-6AF0-444B-8957-A3773F02200E}": ("ProgramW6432", "ProgramFiles"),
+    "{905E63B6-C1BF-494E-B29C-65B732D3D21A}": ("ProgramFiles",),
+    "{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}": ("ProgramFiles(x86)",),
+    "{F38BF404-1D43-42F2-9305-67DE0B28FC23}": ("SystemRoot",),
+    "{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}": ("LOCALAPPDATA",),
+    "{3EB685DB-65F9-4CF6-A03A-E3EF65729F3D}": ("APPDATA",),
+    "{5E6C858F-0E22-4760-9AFE-EA3317B67173}": ("USERPROFILE",),
+}
+_KNOWN_FOLDER_SUB = {
+    "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}": ("SystemRoot", "System32"),
+    "{D65231B0-B2F1-4857-A4CE-A8E7C6EA7D27}": ("SystemRoot", "SysWOW64"),
+}
+_SYSTOAST_CN = {
+    "Windows.SystemToast.SecurityAndMaintenance": "安全和维护",
+    "Windows.SystemToast.AutoPlay": "自动播放",
+    "Windows.SystemToast.BackgroundAccess": "后台活动",
+    "Windows.SystemToast.BdeUnlock": "BitLocker",
+    "Windows.SystemToast.Calling": "通话",
+    "Windows.SystemToast.Devices": "设备",
+    "Windows.SystemToast.HelloFace": "Windows Hello",
+    "Windows.SystemToast.LowDisk": "磁盘空间不足",
+    "Windows.SystemToast.Print.Notification": "打印",
+    "Windows.SystemToast.Share": "共享",
+    "Windows.SystemToast.StartupApp": "启动应用",
+    "Windows.SystemToast.Suggested": "建议",
+    "Windows.SystemToast.WiFiNetworkManager": "无线网络",
+    "Windows.Defender.SecurityCenter": "Windows 安全中心",
+    "Microsoft.Windows.Explorer": "文件资源管理器",
+}
+
+
+def _expand_aumid_path(aumid):
+    """「{已知文件夹 GUID}\\相对路径」形式的应用 ID → 真实 exe 路径；不是这种形式返回 ''。"""
+    m = re.match(r"^(\{[0-9A-Fa-f-]{36}\})\\(.+)$", aumid or "")
+    if not m:
+        return ""
+    g, rest = m.group(1).upper(), m.group(2)
+    base = ""
+    for k in _KNOWN_FOLDER_ENV.get(g, ()):
+        base = os.environ.get(k) or ""
+        if base:
+            break
+    if not base and g in _KNOWN_FOLDER_SUB:
+        env, sub = _KNOWN_FOLDER_SUB[g]
+        root = os.environ.get(env) or ""
+        base = os.path.join(root, sub) if root else ""
+    return os.path.join(base, rest) if base else ""
+
+
+def _load_indirect(s):
+    """解析 @{...} / @dll,-id 这类间接资源字符串；失败原样返回。"""
+    if not s or not s.startswith("@"):
+        return s
+    try:
+        buf = ctypes.create_unicode_buffer(512)
+        sh = ctypes.WinDLL("shlwapi")
+        sh.SHLoadIndirectString.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p,
+                                            ctypes.c_uint, ctypes.c_void_p]
+        sh.SHLoadIndirectString.restype = ctypes.c_long
+        if sh.SHLoadIndirectString(s, buf, 512, None) == 0 and buf.value:
+            return buf.value
+    except Exception:
+        pass
+    return s
+
+
+def _aumid_display(aumid):
+    """应用 ID → (显示名, exe 路径, 发布者)。"""
+    if aumid in _SYSTOAST_CN:
+        return _SYSTOAST_CN[aumid], "", "Microsoft Corporation"
+    path = _expand_aumid_path(aumid)
+    if path:
+        info = _file_version_info(path) if os.path.isfile(path) else {}
+        name = (info or {}).get("FileDescription") or os.path.basename(path)
+        return name, path, (info or {}).get("CompanyName") or ""
+    for root in (HKCU, HKLM):
+        dn = _reg_str(root, r"Software\Classes\AppUserModelId" + "\\" + aumid, "DisplayName")
+        if dn:
+            return _load_indirect(dn), "", ""
+    if aumid.startswith("Windows.SystemToast."):
+        return aumid[len("Windows.SystemToast."):], "", "Microsoft Corporation"
+    if "!" in aumid:                                    # 商店应用：包族名!应用名
+        fam = aumid.split("!", 1)[0].split("_", 1)[0]
+        pub = "Microsoft Corporation" if fam.lower().startswith("microsoft.") else ""
+        return fam.split(".", 1)[-1] if "." in fam else fam, "", pub
+    return aumid, "", ""
+
+
+def _filetime_str(v):
+    try:
+        v = int(v)
+        if v <= 0:
+            return ""
+        t = _dt.datetime(1601, 1, 1, tzinfo=_dt.timezone.utc) + _dt.timedelta(microseconds=v // 10)
+        return t.astimezone().strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
+
+
+def _notify_keys(root_sub, sub="", depth=0):
+    """递归找出所有「应用」键。
+
+    应用 ID 本身可能带反斜杠（{GUID}\\路径\\xx.exe），在注册表里会变成多级子键，
+    所以不能只看第一层：有值的键、或没有子键的叶子键，才是一个应用。
+    """
+    full = root_sub + ("\\" + sub if sub else "")
+    try:
+        k = winreg.OpenKey(HKCU, full, 0, winreg.KEY_READ)
+    except OSError:
+        return
+    with k:
+        n_sub, n_val, _ = winreg.QueryInfoKey(k)
+        vals = {}
+        for i in range(n_val):
+            try:
+                name, val, _t = winreg.EnumValue(k, i)
+                vals[name] = val
+            except OSError:
+                break
+        subs = []
+        for i in range(n_sub):
+            try:
+                subs.append(winreg.EnumKey(k, i))
+            except OSError:
+                break
+    if sub and (vals or not subs):
+        yield sub, vals
+    if depth < 6:
+        for c in subs:
+            yield from _notify_keys(root_sub, (sub + "\\" + c) if sub else c, depth + 1)
+
+
+def list_notify_apps(root_sub=None):
+    """列出注册过通知的应用：[{aumid, name, path, company, enabled, last, adware, system}]。
+
+    排序：命中流氓软件特征库的在前，其次按最近一次发通知的时间倒序。
+    """
+    out = []
+    for aumid, vals in _notify_keys(root_sub or NOTIFY_KEY):
+        name, path, company = _aumid_display(aumid)
+        en = vals.get("Enabled")
+        last = vals.get("LastNotificationAddedTime")
+        hit = adware_check(path=path, name=name, company=company) if (path or company) else {}
+        system = (company.lower().startswith("microsoft") or aumid.startswith("Windows.")
+                  or aumid.startswith("Microsoft.Windows."))
+        out.append({
+            "aumid": aumid, "name": name, "path": path, "company": company,
+            "enabled": not (isinstance(en, int) and en == 0),
+            "last": _filetime_str(last) if last else "",
+            "last_raw": int(last) if isinstance(last, int) else 0,
+            "adware": (hit or {}).get("label", "") if (hit or {}).get("hit") else "",
+            "system": bool(system),
+        })
+    out.sort(key=lambda x: (not x["adware"], -x["last_raw"], x["name"].lower()))
+    return out
+
+
+def set_notify_enabled(aumid, on, root_sub=None):
+    """开 / 关某个应用的系统通知。返回 (ok, msg)。只写 HKCU，不需要管理员。"""
+    sub = (root_sub or NOTIFY_KEY) + "\\" + aumid
+    try:
+        with winreg.CreateKeyEx(HKCU, sub, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, "Enabled", 0, winreg.REG_DWORD, 1 if on else 0)
+    except OSError as e:
+        return False, "写注册表失败：%s" % e
+    log_line("notify %s -> %s" % (aumid, "on" if on else "off"))
+    return True, ("已允许通知：%s" if on else "已关闭通知：%s") % aumid
 
 
 # --------------------------------------------------------------------------
@@ -3952,6 +4378,46 @@ def analyze(raw):
                  "items": [{"hive": x["hive"], "kind": x["kind"], "name": x["name"]} for x in upd]},
             default=True)
 
+    # ---------------- 开机自启：第三方的开机 / 登录计划任务 ----------------
+    # 全家桶最爱用计划任务自启：任务管理器的「启动应用」里看不到，以前这里也只统计个数。
+    # 现在逐条列出、带程序 / 发布者 / 签名，可以直接禁止（Disable-ScheduledTask，可还原）。
+    for tp in (sysd.get("tasks") or []):
+        if not isinstance(tp, str) or tp.lower().startswith("\\microsoft\\") \
+                or _OWN_AUTOSTART.search(tp):
+            continue
+        tcmd = _task_command(tp)
+        if tcmd:
+            _exe, _args = split_cmdline(tcmd)
+            _kapp = describe_app(_exe, _args)
+        else:
+            _kapp = {}
+        if _kapp and is_microsoft(_kapp):
+            continue                                    # OneDrive / Edge 更新这类微软自家任务
+        tname = tp.rsplit("\\", 1)[-1]
+        _hit = adware_check(path=(_kapp or {}).get("path", ""), name=tname,
+                            company=(_kapp or {}).get("company", ""), cmd=tcmd)
+        _detail = ("计划任务『%s』会在开机或登录时自动运行，任务管理器的「启动应用」里看不到它。\n\n"
+                   "● 禁止启动：Disable-ScheduledTask，任务定义原样保留，只是不再触发；\n"
+                   "  随时可在「任务计划程序」里重新启用，或用本工具『还原』。\n\n"
+                   "任务：%s\n命令：%s") % (tname, tp, tcmd or "（需要管理员权限才能读到）")
+        if _hit.get("hit"):
+            _detail = "命中流氓软件特征库：%s\n\n" % _hit.get("label", "") + _detail
+        _tfix = {"type": "task_off", "risk": "safe", "items": [tp]}
+        add(id="task_item@" + tp, cat="开机自启", sev="mid" if _hit.get("hit") else "info",
+            name=tname, src="计划任务",
+            title="计划任务：%s" % tname,
+            short=("流氓软件：%s" % _hit.get("label", "")) if _hit.get("hit") else "开机 / 登录时运行",
+            impact="开机 / 登录时不再拉起",
+            app=_kapp or None,
+            detail=_detail,
+            fix=dict(_tfix),
+            opts={"block": {"title": "计划任务：%s" % tname,
+                            "short": "禁止触发（任务保留）",
+                            "impact": "开机 / 登录时不再拉起",
+                            "detail": _detail,
+                            "fix": dict(_tfix)}},
+            default=False)
+
     # ---------------- 延迟启动（可选优化） ----------------
     # 每个对象都提供「延迟 / 禁止 / 删除」三种取舍（服务不提供删除：删服务键风险太高，
     # 失效残留走『服务与残留』分类）。勾选后按所选方式执行，互不影响。
@@ -4800,15 +5266,29 @@ def _drop_approved(name, hive, kind):
         pass
 
 
+def split_task_path(task):
+    """「\\厂商\\任务名」→ ("\\厂商\\", "任务名")；不带路径的当根目录任务。
+
+    *-ScheduledTask 的 -TaskName 只认名字，子目录里的任务必须另给 -TaskPath，
+    否则找不到（以前只处理过根目录里的延迟任务，所以没暴露）。
+    """
+    t = (task or "").strip()
+    if "\\" not in t:
+        return "\\", t
+    i = t.rfind("\\")
+    path = t[:i + 1]
+    return (path if path.startswith("\\") else "\\" + path), t[i + 1:]
+
+
 def _set_task_enabled(task_name, on, dry_run=False):
-    """启用 / 禁止计划任务（任务定义保留，只是不触发）。"""
+    """启用 / 禁止计划任务（任务定义保留，只是不触发）。task_name 可带路径。"""
     if dry_run:
         return True, "[试运行] %s任务：%s" % ("启用" if on else "禁止", task_name)
     env = dict(os.environ)
-    env["BD_TASK"] = task_name
+    env["BD_TPATH"], env["BD_TASK"] = split_task_path(task_name)
     cmd = "Enable-ScheduledTask" if on else "Disable-ScheduledTask"
-    out = run_ps("%s -TaskName $env:BD_TASK -ErrorAction Stop | Out-Null; 'OK'" % cmd,
-                 timeout=60, env=env)
+    out = run_ps("%s -TaskName $env:BD_TASK -TaskPath $env:BD_TPATH -ErrorAction Stop | Out-Null; 'OK'"
+                 % cmd, timeout=60, env=env)
     if "OK" in out:
         return True, ("已启用任务：%s" if on else "已禁止任务：%s") % task_name
     return False, "任务%s失败：%s（%s）" % ("启用" if on else "禁止", task_name, out.strip()[:160])
