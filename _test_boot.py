@@ -223,6 +223,14 @@ class TestResolvePaths(unittest.TestCase):
 
     def test_task_name_sanitize(self):
         self.assertEqual(bc._task_name_for(r"a\b:c"), "BootDoctor-Delay-a_b_c")
+        # 启动文件夹里的项带 .lnk：任务名不能把扩展名带进去
+        self.assertEqual(bc._task_name_for("DesktopTidy.lnk"), "BootDoctor-Delay-DesktopTidy")
+        self.assertEqual(bc._task_name_for("X.URL"), "BootDoctor-Delay-X")
+        # Windows 不接受任务名以点/空格结尾
+        self.assertEqual(bc._task_name_for("  Weird.  "), "BootDoctor-Delay-Weird")
+        self.assertEqual(bc._task_name_for(""), "BootDoctor-Delay-item")
+        self.assertEqual(bc._legacy_task_names("BootDoctor-Delay-X"),
+                         ["BootDoctor-Delay-X.lnk", "BootDoctor-Delay-X.url"])
 
     def test_exists_raw_protected(self):
         # C:\ 下必然存在的目录级枚举兜底：随便找个系统文件

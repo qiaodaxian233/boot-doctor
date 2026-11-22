@@ -4415,7 +4415,21 @@ def cmd_argv(cmd):
 
 
 def _task_name_for(name):
-    return "BootDoctor-Delay-" + re.sub(r'[\\/:*?"<>|]', "_", str(name))[:120]
+    """启动项名 -> 计划任务名。
+
+    启动文件夹里的项叫 "DesktopTidy.lnk"，直接拼出来会得到
+    "BootDoctor-Delay-DesktopTidy.lnk"——任务名带扩展名，既难看又和「同名启动项」对不上。
+    Windows 也不允许任务名以点或空格结尾，所以统一去掉扩展名和首尾杂字符。
+    """
+    s = str(name).strip().strip(".")
+    s = re.sub(r"(?i)\.(?:lnk|url)$", "", s).strip().strip(".")
+    s = re.sub(r'[\\/:*?"<>|]', "_", s)[:120]
+    return "BootDoctor-Delay-" + (s or "item")
+
+
+def _legacy_task_names(task_name):
+    """老版本把 ".lnk" 带进了任务名，重新延迟同一启动项时会留下同名孤儿任务（会重复启动）。"""
+    return [task_name + ext for ext in (".lnk", ".url")]
 
 
 # --------------------------------------------------------------------------
@@ -5563,6 +5577,9 @@ def _create_delay_task(exe, args, task_name, dry_run=False, delay_sec=None):
         return True, "[试运行] 创建延迟任务：%s  <-  %s（%s）" % (task_name, exe, delay_text(sec))
     if not exe:
         return False, "无法解析启动命令，跳过（建议手动处理）"
+    for legacy in _legacy_task_names(task_name):       # 清掉老版本留下的 ".lnk" 同名任务
+        if os.path.exists(os.path.join(TASKS_DIR, legacy)):
+            _remove_delay_task(legacy)
     ps = (
         "$ErrorActionPreference='Stop';"
         "$exe=$env:BD_EXE;$arguments=$env:BD_ARGS;"
