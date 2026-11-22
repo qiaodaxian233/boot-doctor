@@ -3528,5 +3528,87 @@ class TestDbAutoUpdate(unittest.TestCase):
             self._bd.DbUpdateWorker = self._old_worker
 
 
+class TestRealWorldTaskRegressions(unittest.TestCase):
+    """两个只在真机上暴露的问题的回归测试：干净的 CI 机器上本来测不出来，这里把真机条件造出来。
+
+    1) 常驻的登录任务（火绒弹窗拦截、Process Lasso 之类）长期处于 Running，PowerShell 备用路径按
+       State -eq 'Ready' 过滤会漏掉它们，和直接读任务 XML 的原生实现对不上；
+    2) 老版本把 .lnk 带进了延迟任务名；重新延迟同一启动项时要清掉同名孤儿任务，否则登录时启动两次。
+    """
+    TP = "\\BootDoctorUnitTest\\"
+
+    def setUp(self):
+        if not bc.is_admin():
+            self.skipTest("读写 System32\\Tasks 需要管理员")
+        self._names = []
+
+    def tearDown(self):
+        for tp, tn in self._names:
+            self._ps("Stop-ScheduledTask -TaskName $env:BD_TN -TaskPath $env:BD_TP -ErrorAction SilentlyContinue;"
+                     "Unregister-ScheduledTask -TaskName $env:BD_TN -TaskPath $env:BD_TP -Confirm:$false "
+                     "-ErrorAction SilentlyContinue", tp, tn)
+
+    def _ps(self, script, tp, tn, arg="/c ping -n 300 127.0.0.1 >nul", exe="cmd.exe"):
+        env = dict(os.environ, BD_TP=tp, BD_TN=tn, BD_ARG=arg, BD_EXE=exe)
+        return bc.run_ps(script, timeout=90, env=env)
+
+    def _register(self, tp, tn, **kw):
+        out = self._ps("$a=New-ScheduledTaskAction -Execute $env:BD_EXE -Argument $env:BD_ARG;"
+                       "$t=New-ScheduledTaskTrigger -AtLogOn;"
+                       "Register-ScheduledTask -TaskName $env:BD_TN -TaskPath $env:BD_TP -Action $a -Trigger $t -Force | Out-Null;'OK'",
+                       tp, tn, **kw)
+        self.assertIn("OK", out, "注册任务失败：%r" % out)
+        self._names.append((tp, tn))
+
+    def _state(self, tp, tn):
+        return self._ps("(Get-ScheduledTask -TaskName $env:BD_TN -TaskPath $env:BD_TP).State", tp, tn).strip()
+
+    def test_running_logon_task_counted_by_both_implementations(self):
+        import time as _t
+        self._register(self.TP, "RunningProbe")
+        self._register(self.TP, "DisabledProbe")
+        self._ps("Disable-ScheduledTask -TaskName $env:BD_TN -TaskPath $env:BD_TP | Out-Null", self.TP, "DisabledProbe")
+        self._ps("Start-ScheduledTask -TaskName $env:BD_TN -TaskPath $env:BD_TP", self.TP, "RunningProbe")
+        state = ""
+        for _ in range(40):
+            state = self._state(self.TP, "RunningProbe")
+            if state == "Running":
+                break
+            _t.sleep(0.5)
+        if state != "Running":
+            self.skipTest("这台机器上没法让登录任务进入 Running 状态（当前：%r）" % state)
+        run_full, dis_full = self.TP + "RunningProbe", self.TP + "DisabledProbe"
+        native = bc.boot_logon_tasks_from_xml()
+        ps = bc._parse_json(bc.run_ps(bc.PS_TASKS, timeout=120))
+        ps = ps if isinstance(ps, list) else [ps]
+        sysps = bc._parse_json(bc.run_ps(bc.PS_SYS, timeout=180)).get("tasks") or []
+        sysps = sysps if isinstance(sysps, list) else [sysps]
+        for name, lst in (("原生（读 XML）", native), ("PS_TASKS", ps), ("PS_SYS", sysps)):
+            self.assertIn(run_full, lst, "%s 漏掉了 Running 状态的常驻登录任务" % name)
+            self.assertNotIn(dis_full, lst, "%s 把已禁用的任务算进来了" % name)
+
+    def test_redelay_removes_legacy_lnk_named_orphan(self):
+        legacy, new = "BootDoctor-Delay-UnitTestOrphan.lnk", "BootDoctor-Delay-UnitTestOrphan"
+        exe = r"C:\BootDoctorUnitTest\not_exist.exe"
+        self._register("\\", legacy, exe=exe, arg="--legacy")
+        self._names.append(("\\", new))                                  # 无论成败都清掉新任务
+        self.assertTrue(os.path.exists(os.path.join(bc.TASKS_DIR, legacy)), "夹具没造出老版本的孤儿任务")
+        self.assertEqual(bc._task_name_for("UnitTestOrphan.lnk"), new, "启动文件夹的项名应去掉 .lnk")
+        ok, msg = bc._create_delay_task(exe, "--new", new, delay_sec=60)
+        self.assertTrue(ok, msg)
+        self.assertFalse(os.path.exists(os.path.join(bc.TASKS_DIR, legacy)), "老版本的同名孤儿任务没清掉（登录时会启动两次）")
+        self.assertTrue(os.path.exists(os.path.join(bc.TASKS_DIR, new)), "新任务没建出来")
+        names = [t["task"] for t in bc.existing_delay_tasks()]
+        self.assertIn(new, names)
+        self.assertNotIn(legacy, names)
+
+    def test_dry_run_never_removes_legacy_task(self):
+        legacy, new = "BootDoctor-Delay-UnitTestDry.lnk", "BootDoctor-Delay-UnitTestDry"
+        self._register("\\", legacy, exe=r"C:\BootDoctorUnitTest\not_exist.exe", arg="--legacy")
+        ok, msg = bc._create_delay_task(r"C:\BootDoctorUnitTest\not_exist.exe", "", new, dry_run=True)
+        self.assertTrue(ok and "试运行" in msg, msg)
+        self.assertTrue(os.path.exists(os.path.join(bc.TASKS_DIR, legacy)), "试运行不能动任何东西")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
