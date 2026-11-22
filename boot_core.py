@@ -935,10 +935,11 @@ def merge_adware_db(old, parsed):
     }
 
 
-def _atomic_write_json(path, obj):
+def _atomic_write_json(path, obj, indent=1):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fp:
-        json.dump(obj, fp, ensure_ascii=False, indent=1)
+        json.dump(obj, fp, ensure_ascii=False, indent=indent,
+                  separators=None if indent else (",", ":"))
         fp.flush()
         try:
             os.fsync(fp.fileno())
@@ -3679,6 +3680,54 @@ def collect(progress=None, should_stop=None):
         raise ScanCancelled()
     P("采集完成，开始分析 …")
     return raw
+
+
+# --------------------------------------------------------------------------
+# 上次体检结果缓存：打开程序先显示它，后台再刷新
+#
+# 存的是采集到的原始数据 raw，不是分析结果：分析规则会随版本升级，
+# 用新版本的 analyze 重新分析旧数据，永远不会显示过时的判断。
+# --------------------------------------------------------------------------
+def last_scan_path():
+    return os.path.join(LOG_DIR, "last_scan.json")
+
+
+def save_last_scan(raw, path=None):
+    """体检完成后存一份（原子写，不会写出半截文件）。返回是否成功。"""
+    try:
+        ensure_dirs()
+        _atomic_write_json(path or last_scan_path(),
+                           {"saved": time.time(), "version": VERSION, "raw": raw}, indent=None)
+        return True
+    except Exception as e:
+        log_line("save_last_scan failed: %r" % (e,))
+        return False
+
+
+def load_last_scan(path=None, max_age_days=14):
+    """读上次体检的原始数据：返回 (raw, 保存时间戳)，没有 / 太旧 / 损坏返回 (None, 0.0)。"""
+    try:
+        with open(path or last_scan_path(), "r", encoding="utf-8") as fp:
+            d = json.load(fp)
+        raw, saved = d["raw"], float(d["saved"])
+        if not isinstance(raw, dict) or not all(k in raw for k in ("startup", "services", "sys")):
+            return None, 0.0
+        if time.time() - saved > max_age_days * 86400:
+            return None, 0.0
+        return raw, saved
+    except Exception:
+        return None, 0.0
+
+
+def age_text(seconds):
+    s_ = max(0, int(seconds))
+    if s_ < 90:
+        return "刚刚"
+    if s_ < 3600:
+        return "%d 分钟前" % (s_ // 60)
+    if s_ < 86400:
+        return "%d 小时前" % (s_ // 3600)
+    return "%d 天前" % (s_ // 86400)
 
 
 # --------------------------------------------------------------------------

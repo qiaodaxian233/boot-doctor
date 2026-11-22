@@ -2265,6 +2265,149 @@ class TestBrowserHijack(unittest.TestCase):
             win.close()
 
 
+class TestInstantOpen(unittest.TestCase):
+    """打开程序先显示上次的体检结果，后台再刷新。"""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._p = os.path.join(self._tmp, "last_scan.json")
+        self._old_path = bc.last_scan_path
+        bc.last_scan_path = lambda: self._p
+        self._old_setting = bc.get_setting("show_last_scan", True)
+
+    def tearDown(self):
+        bc.last_scan_path = self._old_path
+        bc.set_setting("show_last_scan", self._old_setting)
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    @staticmethod
+    def _ids(res):
+        return sorted(f["id"] for f in res["findings"])
+
+    def test_roundtrip_gives_same_analysis(self):
+        raw = fake_raw_multi()
+        self.assertTrue(bc.save_last_scan(raw))
+        back, ts = bc.load_last_scan()
+        self.assertIsNotNone(back)
+        self.assertLess(abs(ts - __import__("time").time()), 30)
+        self.assertEqual(self._ids(bc.analyze(back)), self._ids(bc.analyze(raw)))
+
+    def test_roundtrip_real_machine_data(self):
+        """真实采集的数据过一遍 JSON 再分析，结果必须一样——防止缓存里有 JSON 存不回来的东西。"""
+        raw = bc.collect()
+        self.assertTrue(bc.save_last_scan(raw), "真实数据存不进 JSON")
+        back, _ts = bc.load_last_scan()
+        self.assertIsNotNone(back)
+        self.assertEqual(self._ids(bc.analyze(back)), self._ids(bc.analyze(raw)))
+        print("  缓存文件 %d KB" % (os.path.getsize(self._p) // 1024))
+
+    def test_bad_or_old_cache_is_ignored(self):
+        import json
+        import time as _t
+        self.assertEqual(bc.load_last_scan(), (None, 0.0))                       # 没有
+        with open(self._p, "w", encoding="utf-8") as fp:
+            fp.write("{ 坏了")
+        self.assertEqual(bc.load_last_scan(), (None, 0.0))                       # 损坏
+        with open(self._p, "w", encoding="utf-8") as fp:
+            json.dump({"saved": _t.time(), "raw": {"startup": []}}, fp)
+        self.assertEqual(bc.load_last_scan(), (None, 0.0))                       # 缺关键字段
+        with open(self._p, "w", encoding="utf-8") as fp:
+            json.dump({"saved": _t.time() - 20 * 86400,
+                       "raw": {"startup": [], "services": [], "sys": {}}}, fp)
+        self.assertEqual(bc.load_last_scan(), (None, 0.0))                       # 超过 14 天
+        self.assertEqual(bc.age_text(10), "刚刚")
+        self.assertEqual(bc.age_text(600), "10 分钟前")
+        self.assertEqual(bc.age_text(7200), "2 小时前")
+        self.assertEqual(bc.age_text(3 * 86400), "3 天前")
+
+    def _window(self):
+        from PyQt5.QtWidgets import QApplication
+        import boot_doctor as bd
+        self.app = QApplication.instance() or QApplication([])
+        win = bd.MainWindow(autoscan=False)
+        win.start_scan = lambda: None                 # 别真去体检
+        return win
+
+    def test_cached_shown_then_fresh_keeps_user_checks(self):
+        from PyQt5.QtCore import Qt
+        win = self._window()
+        try:
+            old = fake_raw_multi()
+            bc.save_last_scan(old)
+            win._show_cached_then_scan()
+            self.assertTrue(win._stale)
+            self.assertGreater(win.tree.topLevelItemCount(), 0, "缓存结果没摆出来")
+            self.assertTrue(win.lbl_status.text().startswith("上次体检"), win.lbl_status.text())
+            self.assertIn("上次体检结果", win.lbl_summary.text())
+            first_saved = os.path.getmtime(self._p)
+
+            # 用户在缓存结果上勾了一项默认不勾的
+            pick = None
+            for i in range(win.tree.topLevelItemCount()):
+                p = win.tree.topLevelItem(i)
+                for j in range(p.childCount()):
+                    ch = p.child(j)
+                    f = win._finding_of_item(ch)
+                    if f and f.get("fix") and not f.get("default"):
+                        pick = (ch, f["id"])
+                        break
+                if pick:
+                    break
+            self.assertIsNotNone(pick, "样例里没有默认不勾的可处理项")
+            win._check_items([pick[0]], True)
+
+            import time as _t
+            _t.sleep(0.05)
+            new = fake_raw_multi()
+            win.on_scan_done(new, bc.analyze(new))          # 新结果到了
+            self.assertFalse(win._stale)
+            checked = {f["id"] for f in win._checked_findings()}
+            self.assertIn(pick[1], checked, "刷新后用户勾的项丢了")
+            self.assertGreaterEqual(os.path.getmtime(self._p), first_saved)
+            for i in range(win.tree.topLevelItemCount()):
+                p = win.tree.topLevelItem(i)
+                for j in range(p.childCount()):
+                    if win._finding_of_item(p.child(j)) and win._finding_of_item(p.child(j))["id"] == pick[1]:
+                        self.assertEqual(p.child(j).checkState(0), Qt.Checked)
+        finally:
+            win.close()
+
+    def test_no_apply_while_refreshing(self):
+        import types
+        win = self._window()
+        try:
+            raw = fake_raw_multi()
+            win.on_scan_done(raw, bc.analyze(raw))
+            fs = [f for f in win.result["findings"] if f.get("fix")][:2]
+            self.assertTrue(fs)
+            win._check_items([it for it in [win.tree.topLevelItem(i).child(j)
+                                            for i in range(win.tree.topLevelItemCount())
+                                            for j in range(win.tree.topLevelItem(i).childCount())]
+                              if win._finding_of_item(it) and win._finding_of_item(it).get("fix")][:2], True)
+            win.scan_worker = types.SimpleNamespace(isRunning=lambda: True)   # 假装正在刷新
+            old = bc.make_backup
+            bc.make_backup = lambda *a, **k: (_ for _ in ()).throw(AssertionError("刷新中不该执行修复"))
+            try:
+                win.on_apply()
+                win._run_findings(fs)
+            finally:
+                bc.make_backup = old
+        finally:
+            win.scan_worker = None
+            win.close()
+
+    def test_setting_can_turn_it_off(self):
+        win = self._window()
+        try:
+            bc.save_last_scan(fake_raw_multi())
+            bc.set_setting("show_last_scan", False)
+            win._show_cached_then_scan()
+            self.assertFalse(win._stale)
+            self.assertIsNone(win.result, "关了开关还是显示了缓存")
+        finally:
+            win.close()
+
+
 class _TestWindow(object):
     """在测试进程里开一个真的顶层窗口（独立线程 + 消息循环），用来喂给守护进程。
 

@@ -910,6 +910,9 @@ class SettingsDialog(QDialog):
         self.chk_autoscan = QCheckBox("启动时自动体检")
         self.chk_autoscan.setChecked(bool(bc.get_setting("autoscan", True)))
         g.addWidget(self.chk_autoscan)
+        self.chk_lastscan = QCheckBox("启动时先显示上次的体检结果（后台再刷新）")
+        self.chk_lastscan.setChecked(bool(bc.get_setting("show_last_scan", True)))
+        g.addWidget(self.chk_lastscan)
         self.chk_refresh = QCheckBox("处理完自动重新体检")
         self.chk_refresh.setChecked(bool(bc.get_setting("autorefresh", True)))
         g.addWidget(self.chk_refresh)
@@ -952,6 +955,7 @@ class SettingsDialog(QDialog):
             "ai_model": self.ed_model.text().strip() or bc.AI_MODEL_DEFAULT,
             "ai_timeout": self.sp_timeout.value(),
             "autoscan": self.chk_autoscan.isChecked(),
+            "show_last_scan": self.chk_lastscan.isChecked(),
             "autorefresh": self.chk_refresh.isChecked(),
             "theme": "dark" if self.rb_dark.isChecked() else "light",
         }
@@ -1793,6 +1797,7 @@ class MainWindow(QMainWindow):
         self._icon_provider = QFileIconProvider()
         self._sort_col = -1
         self._sort_desc = False
+        self._stale = False          # 界面上显示的是不是上次的缓存结果（正在后台刷新）
         self.scan_worker = None
         self.fix_worker = None
         self.restore_worker = None
@@ -1810,7 +1815,7 @@ class MainWindow(QMainWindow):
         if os.environ.get("BOOTDOC_NOSCAN"):
             autoscan = False
         if autoscan:
-            QTimer.singleShot(400, self.start_scan)
+            QTimer.singleShot(0, self._show_cached_then_scan)
 
     # ---------------- 界面骨架 ----------------
     def paintEvent(self, ev):
@@ -2847,6 +2852,29 @@ class MainWindow(QMainWindow):
         self.scan_worker.sig_fail.connect(self.on_worker_fail)
         self.scan_worker.start()
 
+    def _scan_busy(self):
+        return bool(self.scan_worker and self.scan_worker.isRunning())
+
+    @guard
+    def _show_cached_then_scan(self):
+        """打开程序：先把上次的体检结果摆出来（毫秒级），再在后台重新体检。"""
+        shown = False
+        if bc.get_setting("show_last_scan", True):
+            shown = self._load_cached()
+        QTimer.singleShot(80 if shown else 400, self.start_scan)
+
+    def _load_cached(self):
+        raw, saved = bc.load_last_scan()
+        if not raw:
+            return False
+        try:
+            res = bc.analyze(raw)            # 用当前版本的规则重新分析，不会显示过时的判断
+        except Exception:
+            bc.log_line("cached analyze failed:\n" + traceback.format_exc())
+            return False
+        self.on_scan_done(raw, res, cached=max(1.0, time.time() - saved))
+        return True
+
     @guard
     def on_progress(self, text):
         # 去掉尾巴的省略号，交给动画统一加「转圈 + 已用时」
@@ -2855,10 +2883,18 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(text)
 
     @guard
-    def on_scan_done(self, raw, res):
+    def on_scan_done(self, raw, res, cached=0.0):
+        """cached>0：这是上次的缓存结果（值是已过去的秒数），先显示，后台还在刷新。"""
+        keep = None
+        if self._stale and not cached and self.result:
+            # 缓存 → 新结果：保留用户已经勾的项；新出现的、默认该勾的也勾上
+            old_ids = {f.get("id") for f in self.result.get("findings", [])}
+            keep = {f.get("id") for f in self._checked_findings() if f.get("id")}
+            keep |= {f.get("id") for f in res.get("findings", [])
+                     if f.get("default") and f.get("id") not in old_ids}
         self._raw = raw
         self.result = res
-        self._fill_tree(res)
+        self._fill_tree(res, keep=keep)
         met = res.get("metrics", {})
         score = res.get("score")
         self.lbl_score.setText(str(score))
@@ -2867,10 +2903,17 @@ class MainWindow(QMainWindow):
         self.lbl_score.setStyleSheet("color:%s;" % gc)
         self.lbl_grade.setText(res.get("grade") or "")
         self.lbl_grade.setStyleSheet("color:%s;" % gc)
-        # 先退出忙碌态（把进度条范围还给评分条），再填分数，否则会被重置成 0
-        self._set_busy(False, "体检完成 %s" % res.get("meta", {}).get("scanned_at", ""))
-        took = getattr(self, "_busy_elapsed", 0.0)
-        self.lbl_status.setText("体检完成 %.1fs" % took if took else "体检完成")
+        if cached:
+            self._stale = True
+            self.lbl_status.setText("上次体检 %s" % bc.age_text(cached))
+            self.statusBar().showMessage("显示的是上次体检的结果（%s），正在后台刷新 …" % bc.age_text(cached))
+        else:
+            self._stale = False
+            # 先退出忙碌态（把进度条范围还给评分条），再填分数，否则会被重置成 0
+            self._set_busy(False, "体检完成 %s" % res.get("meta", {}).get("scanned_at", ""))
+            took = getattr(self, "_busy_elapsed", 0.0)
+            self.lbl_status.setText("体检完成 %.1fs" % took if took else "体检完成")
+            bc.save_last_scan(raw)
         self.bar.setValue(int(score or 0))
         self.bar.setStyleSheet("QProgressBar::chunk{background:%s;}" % gc)
         # 摘要要说清「勾了没有」：否则按钮是“智能优化（0）”，看着像坏了
@@ -2880,6 +2923,8 @@ class MainWindow(QMainWindow):
             summary += "；已默认勾选 %d 项，可直接执行" % n_chk
         else:
             summary += "；当前未勾选，选中行后在底部选择处理方式"
+        if cached:
+            summary = "（上次体检结果，刷新中）" + summary
         self.lbl_summary.setText(summary)
         parts = []
         if met.get("last_boot_s") is not None:
@@ -2888,7 +2933,8 @@ class MainWindow(QMainWindow):
         parts.append("自启项 %s" % met.get("startup_enabled"))
         parts.append("自动服务 %s" % met.get("svc_auto"))
         self.lbl_meta.setText("　·　".join(str(x) for x in parts))
-        self._log("体检完成：%s" % res.get("summary", ""))
+        self._log(("显示上次体检结果（%s）：%s" % (bc.age_text(cached), res.get("summary", ""))) if cached
+                  else "体检完成：%s" % res.get("summary", ""))
         self._sync_nav_badges()
         for f in res.get("findings", []):
             self._log("  [%s] %s" % (bc.SEV_CN.get(f["sev"], "?"), f["title"]))
@@ -3650,6 +3696,9 @@ class MainWindow(QMainWindow):
 
     @guard
     def _run_findings(self, fs, op_key=None):
+        if self._scan_busy():
+            self.statusBar().showMessage("正在体检，等刷新完成后再执行")
+            return
         fs = [f for f in (fs or []) if f and f.get("fix")]
         if not fs:
             QMessageBox.information(self, "立即执行",
@@ -3789,6 +3838,9 @@ class MainWindow(QMainWindow):
     def on_apply(self):
         findings = self._checked_findings()
         if not findings:
+            return
+        if self._scan_busy():                      # 正在刷新：别对着旧结果执行
+            self.statusBar().showMessage("正在体检，等刷新完成后再执行")
             return
         if not bc.is_admin():
             r = QMessageBox.question(
