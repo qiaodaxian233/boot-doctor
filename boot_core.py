@@ -3701,7 +3701,9 @@ Get-PhysicalDisk -ErrorAction SilentlyContinue | ForEach-Object { $r.disks += @{
 $r.vols = @()
 Get-Volume -ErrorAction SilentlyContinue | Where-Object {$_.DriveLetter} | ForEach-Object { $r.vols += @{ letter = [string]$_.DriveLetter; free = [int]([math]::Round($_.SizeRemaining / 1GB)); total = [int]([math]::Round($_.Size / 1GB)) } }
 $r.tasks = @()
-Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Ready' -and @($_.Triggers | Where-Object { $_.CimClass.CimClassName -match 'BootTrigger|LogonTrigger' }).Count -gt 0 } | Select-Object -First 200 | ForEach-Object { $r.tasks += ($_.TaskPath + $_.TaskName) }
+# 只要没被禁用就算：Ready / Running / Queued 都收。常驻程序（火绒弹窗拦截、Process Lasso 之类）
+# 的登录任务长期是 Running，用 State -eq 'Ready' 会把它们全漏掉，和读 XML 的原生实现也对不上。
+Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.State -ne 'Disabled' -and @($_.Triggers | Where-Object { $_.CimClass.CimClassName -match 'BootTrigger|LogonTrigger' }).Count -gt 0 } | Select-Object -First 200 | ForEach-Object { $r.tasks += ($_.TaskPath + $_.TaskName) }
 $r | ConvertTo-Json -Depth 6 -Compress
 """
 
@@ -3807,8 +3809,9 @@ ConvertTo-Json -InputObject @{ disks = @($r); security = $sec } -Depth 6 -Compre
 """
 
 PS_TASKS = r"""
+# 同步 PS_SYS：只排除 Disabled，Running / Queued 也算开机登录任务
 $r = @()
-Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Ready' -and @($_.Triggers | Where-Object { $_.CimClass.CimClassName -match 'BootTrigger|LogonTrigger' }).Count -gt 0 } | Select-Object -First 200 | ForEach-Object { $r += ($_.TaskPath + $_.TaskName) }
+Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.State -ne 'Disabled' -and @($_.Triggers | Where-Object { $_.CimClass.CimClassName -match 'BootTrigger|LogonTrigger' }).Count -gt 0 } | Select-Object -First 200 | ForEach-Object { $r += ($_.TaskPath + $_.TaskName) }
 ConvertTo-Json -InputObject @($r) -Compress
 """
 
