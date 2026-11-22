@@ -76,6 +76,18 @@ def fake_raw():
     }
 
 
+def fake_raw_multi():
+    """多选 / 批量用例专用：保证至少 3 条普通自启项。
+
+    以前这两个用例靠本机已有的 BootDoctor-Delay 任务凑数，换一台干净机器（CI）就不够 3 条。
+    """
+    raw = fake_raw()
+    for n in ("UnitTestToolA", "UnitTestToolB", "UnitTestToolC"):
+        raw["startup"].append({"name": n, "cmd": n.lower() + ".exe", "source": "用户 Run",
+                               "kind": "run", "hive": "HKCU", "subkey": None, "enabled": True})
+    return raw
+
+
 class TestAnalyze(unittest.TestCase):
     def test_rules_and_score(self):
         res = bc.analyze(fake_raw())
@@ -312,10 +324,11 @@ class TestGuiOffscreen(unittest.TestCase):
         from PyQt5.QtWidgets import QApplication
         import boot_doctor as bd
 
-        res = bc.analyze(fake_raw())
+        raw = fake_raw_multi()
+        res = bc.analyze(raw)
         win = bd.MainWindow(autoscan=False)
         win.show()
-        win.on_scan_done(fake_raw(), res)
+        win.on_scan_done(raw, res)
         rows = []
         for i in range(win.tree.topLevelItemCount()):
             p = win.tree.topLevelItem(i)
@@ -352,10 +365,11 @@ class TestGuiOffscreen(unittest.TestCase):
         from PyQt5.QtWidgets import QApplication
         import boot_doctor as bd
 
-        res = bc.analyze(fake_raw())
+        raw = fake_raw_multi()
+        res = bc.analyze(raw)
         win = bd.MainWindow(autoscan=False)
         win.show()
-        win.on_scan_done(fake_raw(), res)
+        win.on_scan_done(raw, res)
 
         rows = []
         for i in range(win.tree.topLevelItemCount()):
@@ -1445,6 +1459,101 @@ class TestUiPerf(unittest.TestCase):
             self.assertGreaterEqual(win.width(), int(avail.width() * 0.7))
         finally:
             win.close()
+
+
+
+def _as_list(v):
+    if v is None:
+        return []
+    return v if isinstance(v, list) else [v]
+
+
+class TestNativeSysInfo(unittest.TestCase):
+    """原生采集（sys_info_native）必须和原来的 PS_SYS 结果一致：同一台机器上真跑两边对照。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ps = bc._parse_json(bc.run_ps(bc.PS_SYS, timeout=180)) or {}
+        cls.nat = bc.sys_info_native()
+
+    def test_basic_fields(self):
+        self.assertEqual(self.nat["build"], str(self.ps.get("build")))
+        self.assertAlmostEqual(self.nat["ramGB"], float(self.ps.get("ramGB") or 0), delta=0.2)
+        self.assertTrue(self.nat["osName"].startswith("Microsoft Windows"), self.nat["osName"])
+
+    def test_boot_time(self):
+        import datetime as _d
+        fmt = "%Y-%m-%d %H:%M:%S"
+        a = _d.datetime.strptime(self.nat["bootTime"], fmt)
+        b = _d.datetime.strptime(self.ps["bootTime"], fmt)
+        self.assertLessEqual(abs((a - b).total_seconds()), 120,
+                             "原生 %s / WMI %s" % (self.nat["bootTime"], self.ps["bootTime"]))
+
+    def test_services(self):
+        self.assertLessEqual(abs(self.nat["svcAuto"] - int(self.ps.get("svcAuto") or 0)), 3,
+                             "自动服务数 原生 %s / PS %s" % (self.nat["svcAuto"], self.ps.get("svcAuto")))
+        diff = set(self.nat["svcAutoDown"]) ^ set(_as_list(self.ps.get("svcAutoDown")))
+        self.assertLessEqual(len(diff), 3, "未运行的自动服务对不上：%s" % sorted(diff))
+
+    def test_volumes(self):
+        nat = {v["letter"]: v for v in self.nat["vols"]}
+        self.assertIn("C", nat)
+        for v in _as_list(self.ps.get("vols")):
+            if v.get("total") and v["letter"] in nat:
+                self.assertLessEqual(abs(nat[v["letter"]]["total"] - v["total"]), 1)
+
+    def test_disks(self):
+        key = lambda d: (d.get("name"), d.get("media"), d.get("health"))   # noqa: E731
+        self.assertEqual(sorted(map(key, self.nat["disks"])),
+                         sorted(map(key, _as_list(self.ps.get("disks")))))
+
+    def test_tasks(self):
+        if not bc.is_admin():
+            self.skipTest("读 System32\\Tasks 需要管理员；普通权限下走 PowerShell 兜底")
+        diff = set(self.nat["tasks"]) ^ set(_as_list(self.ps.get("tasks")))
+        self.assertLessEqual(len(diff), 5, "开机/登录任务对不上：%s" % sorted(diff)[:10])
+
+
+class TestEventsQuery(unittest.TestCase):
+    """新版 PS_EVENTS（服务端过滤）必须和旧版结果一致。"""
+
+    def test_new_matches_legacy(self):
+        new = bc._parse_json(bc.run_ps(bc.PS_EVENTS, timeout=180)) or {}
+        old = bc._parse_json(bc.run_ps(bc.PS_EVENTS_LEGACY, timeout=180)) or {}
+        for k in ("c7005", "c7005_7d", "c7005_1h", "c7023"):
+            self.assertEqual(int(new.get(k) or 0), int(old.get(k) or 0), k)
+        self.assertEqual(new.get("last7005") or "", old.get("last7005") or "")
+        # 旧版只在最近 800 条里找，新版直接按事件 ID 查，所以旧结果应是新结果的前缀
+        ob = [b.get("time") for b in _as_list(old.get("boots"))]
+        nb = [b.get("time") for b in _as_list(new.get("boots"))]
+        self.assertEqual(nb[:len(ob)], ob)
+        osl = [(x.get("id"), x.get("time"), x.get("name")) for x in _as_list(old.get("slow"))]
+        nsl = [(x.get("id"), x.get("time"), x.get("name")) for x in _as_list(new.get("slow"))]
+        self.assertEqual(nsl[:len(osl)], osl)
+        self.assertEqual([x.get("msg") for x in _as_list(new.get("scm"))],
+                         [x.get("msg") for x in _as_list(old.get("scm"))])
+
+
+class TestLauncher(unittest.TestCase):
+    def test_bat_finds_python(self):
+        """启动体检.bat 去掉了写死的路径兜底后，必须还能找到 pythonw（真跑一遍 bat 的查找逻辑）。"""
+        import subprocess
+        src = os.path.join(BASE, "启动体检.bat")
+        with open(src, "rb") as fp:
+            data = fp.read()
+        # 把真正启动程序的那一行换成 echo，其余原样执行
+        probe = [b"echo PY=[%PY%]" if ln.lstrip().lower().startswith(b"start ") else ln
+                 for ln in data.split(b"\n")]
+        with tempfile.TemporaryDirectory() as td:
+            bat = os.path.join(td, "probe.bat")
+            with open(bat, "wb") as fp:
+                fp.write(b"\r\n".join(x.rstrip(b"\r") for x in probe))
+            out = subprocess.run(["cmd", "/c", bat], capture_output=True, cwd=td,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        txt = out.stdout.decode("gbk", "replace")
+        m = [ln for ln in txt.splitlines() if ln.startswith("PY=[")]
+        self.assertTrue(m, txt[-500:])
+        self.assertRegex(m[0].lower(), r"pythonw?\.exe\]|pyw(\.exe)?\]", txt[-500:])
 
 
 if __name__ == "__main__":

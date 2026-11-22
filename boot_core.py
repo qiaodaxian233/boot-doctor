@@ -2240,7 +2240,7 @@ Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'R
 $r | ConvertTo-Json -Depth 6 -Compress
 """
 
-PS_EVENTS = r"""
+PS_EVENTS_LEGACY = r"""
 $r = @{}
 $r.boots = @()
 $ev = Get-WinEvent -LogName 'Microsoft-Windows-Diagnostics-Performance/Operational' -MaxEvents 800 -ErrorAction SilentlyContinue | Where-Object {$_.Id -eq 100} | Select-Object -First 10
@@ -2270,6 +2270,276 @@ if($le){ $r.last7005 = $le.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss') }
 $r.c7023 = @(Get-WinEvent -FilterHashtable @{LogName='System'; Id=7023; StartTime=(Get-Date).AddDays(-1)} -MaxEvents 2000 -ErrorAction SilentlyContinue).Count
 $r | ConvertTo-Json -Depth 6 -Compress
 """
+
+PS_EVENTS = r"""
+$r = @{}
+$r.boots = @()
+$dp = 'Microsoft-Windows-Diagnostics-Performance/Operational'
+$ev = Get-WinEvent -FilterHashtable @{LogName=$dp; Id=100} -MaxEvents 10 -ErrorAction SilentlyContinue
+foreach($e in $ev){
+  $x = [xml]$e.ToXml(); $d = @{}
+  foreach($dd in $x.Event.EventData.Data){ $d[$dd.Name] = $dd.'#text' }
+  $r.boots += @{ time = $e.TimeCreated.ToString('yyyy-MM-dd HH:mm'); boot = [int]([double]$d['BootTime'] / 1000); main = [int]([double]$d['MainPathBootTime'] / 1000); post = [int]([double]$d['BootPostBootTime'] / 1000); profile = [int]([double]$d['BootUserProfileProcessingTime'] / 1000); explorer = [int]([double]$d['BootExplorerInitTime'] / 1000); apps = [int]$d['BootNumStartupApps'] }
+}
+$r.slow = @()
+Get-WinEvent -FilterHashtable @{LogName=$dp; Id=101,102,103} -MaxEvents 40 -ErrorAction SilentlyContinue | ForEach-Object {
+  $x = [xml]$_.ToXml(); $d = @{}
+  foreach($dd in $x.Event.EventData.Data){ $d[$dd.Name] = $dd.'#text' }
+  $n = $d['Name']; if(-not $n){ $n = $d['FriendlyName'] }; if(-not $n){ $n = $d['DriverName'] }
+  $t = 0; if($d['TotalTime']){ $t = [int]([double]$d['TotalTime'] / 10000) }
+  $r.slow += @{ id = $_.Id; time = $_.TimeCreated.ToString('MM-dd HH:mm'); name = [string]$n; ms = $t }
+}
+$r.scm = @()
+Get-WinEvent -FilterHashtable @{LogName='System'; Id=7009,7026,7000,7031; StartTime=(Get-Date).AddDays(-7)} -MaxEvents 60 -ErrorAction SilentlyContinue | ForEach-Object {
+  $r.scm += @{ id = $_.Id; time = $_.TimeCreated.ToString('MM-dd HH:mm'); msg = [string](($_.Message -split "`r?`n")[0]) }
+}
+$now = Get-Date
+$e7 = @(Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Service Control Manager'; Id=7005; StartTime=$now.AddDays(-7)} -MaxEvents 8000 -ErrorAction SilentlyContinue)
+$t1d = $now.AddDays(-1); $t1h = $now.AddHours(-1)
+$r.c7005_7d = $e7.Count
+$r.c7005 = @($e7 | Where-Object { $_.TimeCreated -ge $t1d }).Count
+$r.c7005_1h = @($e7 | Where-Object { $_.TimeCreated -ge $t1h }).Count
+$r.last7005 = ''
+if($e7.Count -gt 0 -and $e7[0].TimeCreated -ge $now.AddDays(-2)){ $r.last7005 = $e7[0].TimeCreated.ToString('yyyy-MM-dd HH:mm:ss') }
+$r.c7023 = @(Get-WinEvent -FilterHashtable @{LogName='System'; Id=7023; StartTime=$now.AddDays(-1)} -MaxEvents 2000 -ErrorAction SilentlyContinue).Count
+$r | ConvertTo-Json -Depth 6 -Compress
+"""
+
+
+# --------------------------------------------------------------------------
+# 系统信息：原生读取（替代 PS_SYS 里的大部分命令）
+#
+# 实测（CI 机器）PS_SYS 冷启动 5.1 秒：Get-PhysicalDisk 要先加载 Storage 模块（1.1s），
+# Get-ScheduledTask 要枚举全部任务的 CIM 对象（0.6s），再加上 PowerShell / CIM 本身的冷启动。
+# 这些信息其实都能从注册表、Win32 API、任务 XML 直接拿到，只有磁盘健康度必须走 WMI，
+# 改用 Get-CimInstance 直接查 MSFT_PhysicalDisk，绕开 Storage 模块。
+# 任何一步失败都退回原来的 PowerShell 查询，结果结构不变。
+# --------------------------------------------------------------------------
+
+PS_DISKS = r"""
+$m = @{0='Unspecified';3='HDD';4='SSD';5='SCM'}
+$h = @{0='Healthy';1='Warning';2='Unhealthy';5='Unknown'}
+$r = @()
+Get-CimInstance -Namespace root/Microsoft/Windows/Storage -ClassName MSFT_PhysicalDisk -ErrorAction SilentlyContinue | ForEach-Object {
+  $mt = $m[[int]$_.MediaType]; if(-not $mt){ $mt = [string]$_.MediaType }
+  $hs = $h[[int]$_.HealthStatus]; if(-not $hs){ $hs = [string]$_.HealthStatus }
+  $r += @{ name = [string]$_.FriendlyName; media = $mt; size = [int]([math]::Round($_.Size / 1GB)); health = $hs }
+}
+ConvertTo-Json -InputObject @($r) -Depth 4 -Compress
+"""
+
+PS_TASKS = r"""
+$r = @()
+Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Ready' -and @($_.Triggers | Where-Object { $_.CimClass.CimClassName -match 'BootTrigger|LogonTrigger' }).Count -gt 0 } | Select-Object -First 200 | ForEach-Object { $r += ($_.TaskPath + $_.TaskName) }
+ConvertTo-Json -InputObject @($r) -Compress
+"""
+
+_EDITION_CN = {
+    "Core": "家庭版", "CoreCountrySpecific": "家庭中文版", "CoreSingleLanguage": "家庭单语言版",
+    "Professional": "专业版", "ProfessionalEducation": "专业教育版",
+    "ProfessionalWorkstation": "专业工作站版", "Education": "教育版",
+    "Enterprise": "企业版", "EnterpriseS": "企业版 LTSC", "IoTEnterprise": "IoT 企业版",
+    "IoTEnterpriseS": "IoT 企业版 LTSC",
+}
+_CV = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+
+
+def _os_caption():
+    """系统名称。注意 Win11 的注册表 ProductName 仍写着「Windows 10」，要按版本号纠正。"""
+    prod = _reg_str(HKLM, _CV, "ProductName") or "Windows"
+    build = _reg_str(HKLM, _CV, "CurrentBuild") or _reg_str(HKLM, _CV, "CurrentBuildNumber")
+    if "server" in prod.lower():
+        return "Microsoft " + prod
+    fam = "Windows 11" if build.isdigit() and int(build) >= 22000 else "Windows 10"
+    ed = _reg_str(HKLM, _CV, "EditionID")
+    cn = _EDITION_CN.get(ed)
+    if cn:
+        return "Microsoft %s %s" % (fam, cn)
+    return "Microsoft " + prod.replace("Windows 10", fam)
+
+
+def _boot_time_str():
+    """上次开机时间。取内核记录的 BootTime（WMI 的 LastBootUpTime 也是它），失败再按运行时长推算。"""
+    try:
+        buf = (ctypes.c_ubyte * 48)()
+        n = ctypes.c_ulong(0)
+        nt = ctypes.WinDLL("ntdll")
+        nt.NtQuerySystemInformation.restype = ctypes.c_long
+        nt.NtQuerySystemInformation.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong,
+                                                ctypes.POINTER(ctypes.c_ulong)]
+        if nt.NtQuerySystemInformation(3, buf, 48, ctypes.byref(n)) == 0:   # SystemTimeOfDayInformation
+            ft = ctypes.c_longlong.from_buffer(buf).value                   # UTC，100ns，自 1601 年起
+            utc = _dt.datetime(1601, 1, 1, tzinfo=_dt.timezone.utc) + _dt.timedelta(microseconds=ft // 10)
+            return utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+    k32 = ctypes.WinDLL("kernel32")
+    k32.GetTickCount64.restype = ctypes.c_ulonglong
+    up = _dt.timedelta(milliseconds=int(k32.GetTickCount64()))
+    return (_dt.datetime.now() - up).strftime("%Y-%m-%d %H:%M:%S")
+
+
+class _MEMSTAT(ctypes.Structure):
+    _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+
+def _ram_gb():
+    m = _MEMSTAT()
+    m.dwLength = ctypes.sizeof(_MEMSTAT)
+    k32 = ctypes.WinDLL("kernel32")
+    k32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(_MEMSTAT)]
+    if not k32.GlobalMemoryStatusEx(ctypes.byref(m)):
+        raise OSError("GlobalMemoryStatusEx failed")
+    return round(m.ullTotalPhys / float(1 << 30), 1)
+
+
+class _SVC_STATUS_PROCESS(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_ulong) for n in (
+        "dwServiceType", "dwCurrentState", "dwControlsAccepted", "dwWin32ExitCode",
+        "dwServiceSpecificExitCode", "dwCheckPoint", "dwWaitHint", "dwProcessId",
+        "dwServiceFlags")]
+
+
+class _ENUM_SVC_STATUS_PROCESS(ctypes.Structure):
+    _fields_ = [("lpServiceName", ctypes.c_wchar_p), ("lpDisplayName", ctypes.c_wchar_p),
+                ("status", _SVC_STATUS_PROCESS)]
+
+
+def _scm_service_states():
+    """{服务名: 当前状态}（4 = 运行中）。一次 EnumServicesStatusExW 拿全，不用起 PowerShell。"""
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    adv.OpenSCManagerW.restype = ctypes.c_void_p
+    adv.OpenSCManagerW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_ulong]
+    adv.EnumServicesStatusExW.restype = ctypes.c_int
+    adv.EnumServicesStatusExW.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p,
+        ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.c_ulong), ctypes.c_wchar_p]
+    adv.CloseServiceHandle.argtypes = [ctypes.c_void_p]
+    h = adv.OpenSCManagerW(None, None, 0x0004)          # SC_MANAGER_ENUMERATE_SERVICE
+    if not h:
+        raise OSError(ctypes.get_last_error(), "OpenSCManagerW failed")
+    out = {}
+    try:
+        need, cnt, resume = ctypes.c_ulong(0), ctypes.c_ulong(0), ctypes.c_ulong(0)
+        size = 128 * 1024
+        for _ in range(16):
+            buf = ctypes.create_string_buffer(size)
+            ok = adv.EnumServicesStatusExW(h, 0, 0x30, 3, buf, size, ctypes.byref(need),
+                                           ctypes.byref(cnt), ctypes.byref(resume), None)
+            err = ctypes.get_last_error()
+            arr = ctypes.cast(buf, ctypes.POINTER(_ENUM_SVC_STATUS_PROCESS))
+            for i in range(cnt.value):                  # 字符串指针指向 buf 内部，必须趁 buf 还在时读完
+                out[arr[i].lpServiceName] = int(arr[i].status.dwCurrentState)
+            if ok:
+                break
+            if err != 234:                              # ERROR_MORE_DATA：带着 resume 句柄继续
+                raise OSError(err, "EnumServicesStatusExW failed")
+            size = max(size, int(need.value) + 4096)
+    finally:
+        adv.CloseServiceHandle(h)
+    return out
+
+
+def _svc_auto_stats():
+    states = _scm_service_states()
+    auto = [n for n in states
+            if _reg_dword(HKLM, _SVC_BASE + "\\" + n, "Start") == 2]   # 2 = 自动（含延迟自动）
+    down = sorted(n for n in auto if states[n] != 4)
+    return len(auto), len(auto) - len(down), down
+
+
+def _volumes():
+    k32 = ctypes.WinDLL("kernel32")
+    k32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
+    mask = int(k32.GetLogicalDrives())
+    out = []
+    for i in range(26):
+        if not mask & (1 << i):
+            continue
+        root = "%s:\\" % chr(65 + i)
+        if k32.GetDriveTypeW(root) not in (2, 3):        # 只要本地硬盘 / 可移动盘，跳过光驱和网络盘
+            continue
+        try:
+            u = shutil.disk_usage(root)
+        except OSError:
+            continue
+        out.append({"letter": chr(65 + i), "free": int(round(u.free / float(1 << 30))),
+                    "total": int(round(u.total / float(1 << 30)))})
+    return out
+
+
+def _task_xml_text(path):
+    with open(path, "rb") as fp:
+        raw = fp.read(512 * 1024)
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16", "ignore")
+    return raw.decode("utf-8", "ignore")
+
+
+def boot_logon_tasks_from_xml(root=None, limit=200):
+    """开机 / 登录触发、且未被禁用的计划任务（直接读 System32\\Tasks 下的 XML，需管理员）。
+
+    返回与 PS_SYS 里 $r.tasks 相同的「\\路径\\任务名」列表；目录读不了时抛 PermissionError。
+    """
+    root = root or TASKS_DIR
+    os.listdir(root)                                    # 普通权限下这里就会抛，交给调用方退回 PowerShell
+    out = []
+    for dp, dirs, files in os.walk(root):
+        dirs.sort()
+        for fn in sorted(files):
+            p = os.path.join(dp, fn)
+            try:
+                txt = _task_xml_text(p)
+            except OSError:
+                continue
+            m_trg = re.search(r"<Triggers>(.*?)</Triggers>", txt, re.S)
+            if not m_trg or not re.search(r"<(BootTrigger|LogonTrigger)\b", m_trg.group(1)):
+                continue
+            m_set = re.search(r"<Settings>(.*?)</Settings>", txt, re.S)
+            if m_set and re.search(r"<Enabled>\s*false\s*</Enabled>", m_set.group(1), re.I):
+                continue                                # Disable-ScheduledTask 写的就是这里
+            rel = os.path.relpath(p, root).replace("/", "\\")
+            out.append("\\" + rel)
+    out.sort(key=lambda x: (x.count("\\") > 1, x.lower()))   # 根目录任务在前，和 Get-ScheduledTask 一致
+    return out[:limit]
+
+
+def sys_info_native(with_disks=True):
+    """PS_SYS 的原生实现，返回结构与 PS_SYS 完全一致。"""
+    auto, run, down = _svc_auto_stats()
+    d = {
+        "osName": _os_caption(),
+        "build": _reg_str(HKLM, _CV, "CurrentBuild") or _reg_str(HKLM, _CV, "CurrentBuildNumber"),
+        "bootTime": _boot_time_str(),
+        "ramGB": _ram_gb(),
+        "svcAuto": auto, "svcAutoRun": run, "svcAutoDown": down,
+        "vols": _volumes(),
+        "disks": [],
+        "tasks": [],
+    }
+    if with_disks:
+        disks = _parse_json(run_ps(PS_DISKS, timeout=60))
+        d["disks"] = disks if isinstance(disks, list) else []
+    try:
+        d["tasks"] = boot_logon_tasks_from_xml()
+    except OSError:
+        t = _parse_json(run_ps(PS_TASKS, timeout=120))
+        d["tasks"] = t if isinstance(t, list) else []
+    return d
+
+
+def collect_sys():
+    """系统信息：先走原生，出任何异常都整体退回 PowerShell（结构相同）。"""
+    try:
+        return sys_info_native()
+    except Exception as e:
+        log_line("sys_info_native failed, fallback to PS_SYS: %r" % (e,))
+        return _parse_json(run_ps(PS_SYS, timeout=120))
 
 
 def get_filters():
@@ -2332,8 +2602,9 @@ def collect(progress=None, should_stop=None):
     ensure_dirs()
     raw = {"ts": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "admin": is_admin()}
 
-    # 两个 PowerShell 查询先扔后台，主线程同时做便宜的注册表读取
-    wait_sys = _bg_call(lambda: _parse_json(run_ps(PS_SYS, timeout=120)))
+    # 系统信息（大部分原生，磁盘健康走一个轻量 PowerShell）和事件日志扔后台，
+    # 主线程同时做便宜的注册表读取
+    wait_sys = _bg_call(collect_sys)
     wait_evt = _bg_call(lambda: _parse_json(run_ps(PS_EVENTS, timeout=180)))
 
     P("读取注册表：开机自启项 …")

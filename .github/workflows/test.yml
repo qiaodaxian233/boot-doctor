@@ -1,0 +1,28 @@
+name: windows-test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+      - name: 离屏自测
+        run: python .github/ci_annotate.py tests python _test_boot.py
+      - name: 体检分段计时
+        if: always()
+        run: python .github/ci_annotate.py profile python _prof_detail.py

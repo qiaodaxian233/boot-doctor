@@ -22,6 +22,34 @@
 > 出厂策略：只勾选"安全级"项目；"需确认"的项目默认不勾，自己判断后再勾。
 > 排障时请用**重启**（快速启动只加速"关机→开机"）。
 
+## 待发布：体检再提速（采集 2.1s → 0.75s）+ 打开时少起一个 PowerShell
+
+CI（GitHub windows-latest）上逐条计时后，瓶颈在 `PS_SYS`：PowerShell 冷启动 + `Get-PhysicalDisk`
+（要先加载 Storage 模块，1.1s）+ `Get-ScheduledTask`（枚举全部任务的 CIM 对象，0.65s）。
+
+| 采集项 | 原来 | 现在 |
+|---|---|---|
+| 系统名 / 版本 / 内存 / 开机时间 | `Get-CimInstance Win32_OperatingSystem` | 注册表 + `NtQuerySystemInformation` + `GlobalMemoryStatusEx` |
+| 自动服务 / 未运行的自动服务 | `Get-Service` × 3 | `EnumServicesStatusExW` 一次（5ms） |
+| 开机 / 登录触发的计划任务 | `Get-ScheduledTask`（0.65s） | 直读 `System32\Tasks` 下的 XML（43ms），普通权限时退回 PowerShell |
+| 磁盘健康 | `Get-PhysicalDisk`（1.1s） | `Get-CimInstance MSFT_PhysicalDisk`，绕开 Storage 模块 |
+| 卷空间 | `Get-Volume` | `GetLogicalDrives` + `disk_usage` |
+| 开机耗时 / 慢启动事件 | 读最近 800 条再按 ID 过滤 | `FilterHashtable` 按 ID 让日志服务过滤 |
+| 7005 计数 | 同一个查询跑 3 次 + 再查 1 次最新 | 查一次，在内存里按时间分桶 |
+
+| CI 实测 | 原来 | 现在 |
+|---|---|---|
+| 系统信息 | 2555 ms | 437 ms |
+| `collect()` 全流程 | 2071 ms | 746 ms（发现项数量相同） |
+
+任一步原生读取出异常，整体退回原来的 `PS_SYS`，结果结构不变。新增对照测试在同一台机器上
+同时跑原生和 PowerShell 两边，逐项比对（版本号、内存、开机时间、服务、卷、磁盘、任务）。
+
+**打开更快**：`启动体检.bat` 原来先 `net session` 再起一个 PowerShell 去 `Start-Process -Verb RunAs`，
+现在提权交给程序自己（`ShellExecuteW runas`），bat 只负责找 Python（不再写死
+`C:\Users\Administrator\...`，依次找 `%LOCALAPPDATA%` 下的 3.10、PATH 里的 `pythonw`、`pyw`）。
+顺带修了「以管理员身份重启」在 UAC 点「否」时程序也直接退出的问题。
+
 ## 待发布：弹窗守护改事件驱动 + 评审修复
 
 | 级别 | 问题 | 修法 |
