@@ -1854,7 +1854,7 @@ def _make_lnk(path, target, args="", workdir=""):
     out = bc.run_ps("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:BD_P);"
                     "$s.TargetPath=$env:BD_T;$s.Arguments=$env:BD_A;"
                     "if($env:BD_W){$s.WorkingDirectory=$env:BD_W};$s.Save();'OK'", timeout=60, env=env)
-    assert "OK" in out, "造 lnk 失败：%r" % out
+    assert "OK" in out and os.path.isfile(path), "造 lnk 失败：%r（%s）" % (out, path)
 
 
 def _com_read_lnk(path):
@@ -1884,9 +1884,13 @@ class TestLnkParser(unittest.TestCase):
     def test_unicode_name_and_bulk_without_powershell(self):
         """中文文件名 + 批量解析走原生：把 run_ps 换成会抛异常的，也必须解析成功。"""
         with tempfile.TemporaryDirectory() as td:
+            # WScript.Shell 的 Save 在非中文代码页的系统上存不了中文路径（run_ps 会吞掉报错，
+            # 照样输出 OK），所以先用英文名造，再改名成中文名——解析器读的是文件内容，和文件名无关
+            tmp = os.path.join(td, "chrome_link.lnk")
+            _make_lnk(tmp, sys.executable, "--profile-directory=Default")
             lnk = os.path.join(td, "谷歌浏览器.lnk")
-            _make_lnk(lnk, sys.executable, "--profile-directory=Default")
-            self.assertTrue(os.path.isfile(lnk), "夹具没造出文件，目录里是：%r" % (os.listdir(td),))
+            os.rename(tmp, lnk)
+            self.assertTrue(os.path.isfile(lnk), "目录里是：%r" % (os.listdir(td),))
             old = bc.run_ps
             bc.run_ps = lambda *a, **k: (_ for _ in ()).throw(AssertionError("不该起 PowerShell"))
             bc._LNK_CACHE.pop(lnk, None)
