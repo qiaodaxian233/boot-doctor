@@ -678,27 +678,14 @@ class ScanWorker(QThread):
         try:
             raw = bc.collect(progress=lambda t: self.sig_progress.emit(t))
             res = bc.analyze(raw)
-            # 顺手把签名校验做掉（AutoRuns 同款列），结果进缓存，界面上直接读
-            apps = {}
-            for f in res.get("findings", []):
-                app = f.get("app") or {}
-                if app.get("path") and app.get("exists"):
-                    apps[app["path"].lower()] = app
-            if apps:
-                self.sig_progress.emit("校验程序签名（%d 个）…" % len(apps))
-                # WinVerifyTrust 是阻塞的系统调用（ctypes 会释放 GIL），串行 18 个要 0.6s，
-                # 开 6 个线程并行，基本只剩最慢那一个的时间
-                from concurrent.futures import ThreadPoolExecutor
-                paths = list(apps.values())
-
-                def one(app):
-                    try:
-                        bc.app_signature(app)
-                    except Exception:
-                        pass
-
-                with ThreadPoolExecutor(max_workers=6) as ex:
-                    list(ex.map(one, paths))
+            # 顺手把签名校验做掉（AutoRuns 同款列），结果进缓存，界面上直接读。
+            # WinVerifyTrust 是阻塞的系统调用（ctypes 会释放 GIL），多线程并行；
+            # analyze 里为「冒充微软」检查已经预热过一批，这里只补剩下的
+            apps = [f.get("app") or {} for f in res.get("findings", [])]
+            n = sum(1 for a in apps if a.get("path") and a.get("exists"))
+            if n:
+                self.sig_progress.emit("校验程序签名（%d 个）…" % n)
+                bc.warm_signatures(apps)
             self.sig_done.emit(raw, res)
         except Exception:
             self.sig_fail.emit(traceback.format_exc())
@@ -2691,18 +2678,26 @@ class MainWindow(QMainWindow):
             return
         self._cur_app = app
         self.app_head_name.setText(bc.app_label(app))
+        sig = self._sig_of(app)
         bits = [x for x in (app.get("company"), app.get("version")) if x]
         if not app.get("exists"):
             bits.insert(0, "文件不存在（卸载/改名后的残留）")
+        # 公司名是文件自己填的，签名者才是证书上的名字；两边对不上时把真实签名者亮出来
+        signer = (sig.get("signer") or "").strip()
+        comp = (app.get("company") or "").strip().lower()
+        mismatch = bool(signer and comp and signer.lower() not in comp
+                        and comp not in signer.lower())
+        if signer and (mismatch or not comp):
+            bits.append("签名者：%s" % signer)
         self.app_head_meta.setText("　·　".join(bits) or (app.get("path") or ""))
         self.app_head_meta.setStyleSheet(
-            "color:%s;" % (PAL["err"] if not app.get("exists") else PAL["faint"]))
+            "color:%s;" % (PAL["err"] if (not app.get("exists") or (
+                mismatch and "microsoft" in comp and not bc._ms_ish(signer))) else PAL["faint"]))
         ic = self._app_icon(app.get("path") if app.get("exists") else "")
         if ic is not None:
             self.app_head_icon.setPixmap(ic.pixmap(32, 32))
         else:
             self.app_head_icon.clear()
-        sig = self._sig_of(app)
         self.app_head_sig.setText(sig.get("label") or "")
         self.app_head_sig.setToolTip(sig.get("detail") or "")
         self.app_head_sig.setStyleSheet(

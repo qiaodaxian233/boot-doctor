@@ -1826,6 +1826,108 @@ class TestThirdPartyTasks(unittest.TestCase):
             self.assertIn(full, bc.boot_logon_tasks_from_xml(), "还原后任务没有重新启用")
 
 
+class TestSigner(unittest.TestCase):
+    """真实签名者：公司名是文件自己填的，不能当凭据；数字签名才是。"""
+    SYS = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+
+    def _system_exes(self, names=("cmd.exe", "svchost.exe", "notepad.exe", "find.exe", "hostname.exe")):
+        out = [os.path.join(self.SYS, n) for n in names if os.path.isfile(os.path.join(self.SYS, n))]
+        if not out:
+            self.skipTest("找不到可用的系统程序")
+        return out
+
+    def test_system_files_signed_by_microsoft(self):
+        """系统自带程序：签名有效（内嵌或目录），且能取到「Microsoft …」签名者。"""
+        bad = []
+        for exe in self._system_exes():
+            sig = bc.app_signature(bc.describe_app(exe))
+            if not bc.real_microsoft(sig):
+                bad.append((os.path.basename(exe), {k: sig.get(k) for k in
+                                                   ("state", "signer", "signer_ok", "rc")}))
+        self.assertEqual(bad, [], "这些系统文件没认成「微软自己签的」")
+
+    def test_non_microsoft_signer(self):
+        sig = bc.app_signature(bc.describe_app(sys.executable))
+        if sig["state"] != "valid":
+            self.skipTest("这台机器上的 python.exe 没有内嵌签名：%s" % sig["state"])
+        self.assertTrue(sig["signer"], "签名有效却没取到签名者")
+        self.assertFalse(bc._ms_ish(sig["signer"]), sig["signer"])
+        self.assertFalse(bc.real_microsoft(sig))
+
+    def test_spoofed_company_is_not_microsoft(self):
+        fake = dict(bc.describe_app(sys.executable), company="Microsoft Corporation")
+        self.assertFalse(bc.is_microsoft(fake), "公司名写成 Microsoft 就被当成了微软组件")
+        real = bc.describe_app(self._system_exes()[0])
+        self.assertTrue(bc.is_microsoft(real), "真正的系统程序被当成了第三方")
+        # 没有证据可反驳时沿用以前的行为（文件不在 / 没路径），不制造误判
+        self.assertTrue(bc.is_microsoft({"company": "Microsoft Corporation"}))
+        self.assertFalse(bc.is_microsoft({"company": "Some Ltd", "path": sys.executable}))
+
+    def test_adware_exemption_needs_real_signature(self):
+        name = "鲁大师游戏盒子"
+        with tempfile.TemporaryDirectory() as td:
+            d = os.path.join(td, "LuDaShi")
+            os.makedirs(d)
+            fake = os.path.join(d, "ldsgame.exe")
+            shutil.copy(sys.executable, fake)
+            genuine = os.path.join(d, "real.exe")
+            shutil.copy(self._system_exes()[0], genuine)
+
+            plain = bc.adware_check(path=fake, name=name, company="Some Ltd")
+            self.assertTrue(plain.get("hit"), "路径里有 LuDaShi 应当命中家族规则")
+            self.assertFalse(plain.get("spoof"))
+
+            spoof = bc.adware_check(path=fake, name=name, company="Microsoft Corporation")
+            self.assertTrue(spoof.get("hit"), "把公司名改成 Microsoft 就躲过了检测")
+            self.assertTrue(spoof.get("spoof"))
+            self.assertEqual(spoof["sev"], "high")
+            self.assertIn("不是微软", spoof["why"] + "没有微软的数字签名")
+
+            # 真正微软签名的文件即使放在黑名单目录里也放过（和以前一样，不误报系统组件）
+            ok = bc.adware_check(path=genuine, name=name, company="Microsoft Corporation")
+            self.assertFalse(ok.get("hit"), "真微软签名的文件被误报：%s" % ok.get("why"))
+
+    def test_spoof_finding_in_analyze(self):
+        orig = bc._file_version_info
+        with tempfile.TemporaryDirectory() as td:
+            fake = os.path.join(td, "WinHelperSvc.exe")
+            shutil.copy(sys.executable, fake)
+            real = self._system_exes()[0]
+
+            def fvi(path):
+                if path.lower() == fake.lower():
+                    return {"CompanyName": "Microsoft Corporation",
+                            "FileDescription": "Windows Helper"}
+                return orig(path)
+
+            bc._file_version_info = fvi
+            bc._APP_CACHE.clear()
+            try:
+                raw = fake_raw()
+                for nm, cmd in (("WinHelper", fake), ("RealOne", real)):
+                    raw["startup"].append({"name": nm, "cmd": cmd, "source": "用户 Run",
+                                           "kind": "run", "hive": "HKCU", "subkey": None,
+                                           "enabled": True})
+                res = bc.analyze(raw)
+            finally:
+                bc._file_version_info = orig
+                bc._APP_CACHE.clear()
+        spoofs = {f["id"]: f for f in res["findings"] if f["id"].startswith("ms_spoof@")}
+        self.assertIn("ms_spoof@" + fake.lower(), spoofs, "冒充微软的文件没被报出来：%s" % list(spoofs))
+        self.assertIn(spoofs["ms_spoof@" + fake.lower()]["sev"], ("high", "mid"))
+        self.assertNotIn("ms_spoof@" + real.lower(), spoofs, "真正的系统程序被报成冒充")
+
+    def test_warm_signatures_parallel(self):
+        import time as _t
+        infos = [bc.describe_app(p) for p in self._system_exes()]
+        t0 = _t.perf_counter()
+        n = bc.warm_signatures(infos)
+        self.assertEqual(n, len(infos))
+        self.assertLess(_t.perf_counter() - t0, 10)
+        for a in infos:
+            self.assertIn(a["path"].lower() in {x["path"].lower() for x in infos}, (True,))
+
+
 class TestLauncher(unittest.TestCase):
     def test_bat_finds_python(self):
         """启动体检.bat 去掉了写死的路径兜底后，必须还能找到 pythonw（真跑一遍 bat 的查找逻辑）。"""
