@@ -2557,7 +2557,8 @@ class _GuardE2EBase(unittest.TestCase):
         os.environ["BOOTDOC_DATA_DIR"] = cls.td                  # 子进程继承
         cls._saved = {k: getattr(bc, k) for k in ("DATA_DIR", "LOG_DIR", "POPUP_RULES_PATH",
                                                     "GUARD_PID_PATH", "GUARD_STOP_PATH",
-                                                    "AUTOSTART_BASELINE", "AUTOSTART_WATCH_LOG")}
+                                                    "AUTOSTART_BASELINE", "AUTOSTART_WATCH_LOG",
+                                                    "PROC_WATCH_LOG")}
         bc.DATA_DIR = cls.td
         bc.LOG_DIR = os.path.join(cls.td, "_logs")
         bc.POPUP_RULES_PATH = os.path.join(cls.td, "_popup_rules.json")
@@ -2565,6 +2566,7 @@ class _GuardE2EBase(unittest.TestCase):
         bc.GUARD_STOP_PATH = os.path.join(bc.LOG_DIR, "popup_guard.stop")
         bc.AUTOSTART_BASELINE = os.path.join(bc.LOG_DIR, "autostart_baseline.json")
         bc.AUTOSTART_WATCH_LOG = os.path.join(bc.LOG_DIR, "autostart_watch.log")
+        bc.PROC_WATCH_LOG = os.path.join(bc.LOG_DIR, "process_watch.log")
         os.makedirs(bc.LOG_DIR, exist_ok=True)
         cls.rules = cls.make_rules()
         assert bc.save_popup_rules(cls.rules)
@@ -3033,11 +3035,12 @@ class TestJudgeNewProcess(unittest.TestCase):
         bc.app_signature = lambda app: {"state": "valid", "signer": "Some Ltd"}
         self.assertIsNone(bc.judge_new_process(self.proc, strict=True), "有签名的不报")
         bc.app_signature = lambda app: {"state": "unsigned"}
-        elsewhere = os.path.join(self.td, "Tools", "y.exe")
-        os.makedirs(os.path.dirname(elsewhere))
-        open(elsewhere, "wb").write(b"MZ")
-        self.assertIsNone(bc.judge_new_process(dict(self.proc, path=elsewhere), strict=True),
-                          "不在 Temp / AppData 一类位置的不报")
+        old_zone = bc._in_user_dropzone
+        bc._in_user_dropzone = lambda p: False     # 临时目录本身就在 AppData\\Temp 下，所以打桩模拟「别处」
+        try:
+            self.assertIsNone(bc.judge_new_process(self.proc, strict=True), "不在 Temp / AppData 一类位置的不报")
+        finally:
+            bc._in_user_dropzone = old_zone
 
     def test_system_dir_and_missing_file_ignored(self):
         sysexe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
@@ -3188,7 +3191,7 @@ class TestProcWatchE2E(_GuardE2EBase):
         rules = dict(self.rules, auto_kill_adware=True)
         self.assertTrue(bc.save_popup_rules(rules))
         os.utime(bc.POPUP_RULES_PATH, (_t.time() + 5, _t.time() + 5))
-        _t.sleep(2.2)                                   # 让守护重读规则
+        _t.sleep(3.2)                                   # 守护每 1.5 秒重读一次规则
         before_alive = [k for k in self.kids if k.poll() is None]
         k = self._spawn()
         self.assertTrue(self._wait(lambda: k.poll() is not None), "开了自动结束，新进程还活着。日志：\n" + self.log())
@@ -3205,7 +3208,7 @@ class TestProcWatchE2E(_GuardE2EBase):
         rules = dict(self.rules, watch_process=False, auto_kill_adware=True)
         self.assertTrue(bc.save_popup_rules(rules))
         os.utime(bc.POPUP_RULES_PATH, (_t.time() + 10, _t.time() + 10))
-        _t.sleep(2.2)
+        _t.sleep(3.2)
         n0 = len(self._rows_for())
         k = self._spawn()
         _t.sleep(5)

@@ -285,6 +285,7 @@ class Guard(QApplication):
     # ---------------- 新进程提醒 ----------------
     def check_processes(self):
         """对比进程列表：第一次只建基线（守护启动前就在跑的不报），之后出现的新进程逐个判定。"""
+        self.reload_rules()          # 开关改了立即生效：规则文件没变时只是一次 stat，几乎没有开销
         if self.paused or not self.rules.get("watch_process", True):
             return
         try:
