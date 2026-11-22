@@ -1,0 +1,349 @@
+<!DOCTYPE html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>开机体检报告 - Microsoft Windows 10 企业版</title><style>
+*{box-sizing:border-box}
+body{margin:0;padding:0;background:#eef1fa;color:#161b2c;
+ font-family:-apple-system,"Segoe UI","Microsoft YaHei UI",sans-serif;
+ font-size:14px;line-height:1.65}
+.wrap{max-width:960px;margin:0 auto;padding:28px 22px 60px}
+header{background:linear-gradient(135deg,#eef4ff 0%,#e3ebfb 50%,#f2eafd 100%);
+ border:1px solid #dbe2f5;border-radius:14px;padding:22px 24px;margin-bottom:22px;
+ display:flex;align-items:center;gap:24px;flex-wrap:wrap}
+h1{margin:0 0 6px;font-size:21px;letter-spacing:.5px}
+h2{margin:34px 0 12px;font-size:17px;border-bottom:1px solid #dbe2f5;padding-bottom:7px}
+h3{margin:20px 0 8px;font-size:15px}
+.muted{color:#6d7695;font-size:13px}
+.ring{width:104px;height:104px;border-radius:50%;display:flex;align-items:center;
+ justify-content:center;flex:0 0 auto}
+.ring-in{width:82px;height:82px;border-radius:50%;background:#fff;
+ display:flex;flex-direction:column;align-items:center;justify-content:center}
+.ring-in b{font-size:26px;line-height:1}
+.ring-in span{font-size:12px;color:#6d7695;margin-top:3px}
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+ gap:10px;margin:16px 0}
+.metric{background:#fff;border:1px solid #e4e8f5;border-radius:10px;padding:11px 14px}
+.metric .k{font-size:12px;color:#6d7695}
+.metric .v{font-size:17px;font-weight:600;margin-top:2px}
+.badge{display:inline-block;background:#dfe2fa;color:#3c44b0;border-radius:10px;
+ padding:1px 9px;font-size:12px;font-weight:600;vertical-align:middle}
+.card{background:#fff;border:1px solid #e4e8f5;border-radius:10px;padding:14px 16px;
+ margin:10px 0}
+.cardhead{display:flex;align-items:center;gap:9px;margin-bottom:6px}
+.tag{border-radius:6px;padding:1px 8px;font-size:12px;font-weight:600}
+.why{margin:4px 0 8px;font-size:13px;color:#4a5474}
+.tbl{width:100%;border-collapse:collapse;font-size:13px;margin:6px 0}
+.tbl th{text-align:left;color:#6d7695;font-weight:600;font-size:12px;
+ padding:5px 8px;border-bottom:1px solid #e4e8f5}
+.tbl td{padding:5px 8px;border-bottom:1px solid #f1f4fb;vertical-align:top}
+.cmd{margin:8px 0 0;font-size:12px;color:#4a5474}
+code{background:#f1f4fb;border-radius:4px;padding:1px 6px;font-size:12px;
+ font-family:Consolas,monospace;word-break:break-all}
+.chart{margin:8px 0}
+.crow{display:flex;align-items:center;gap:10px;margin:4px 0;font-size:12px}
+.ctime{color:#6d7695;flex:0 0 108px;white-space:nowrap}
+.cbar{flex:1;background:#eef1fa;border-radius:3px;height:12px;overflow:hidden}
+.cbar i{display:block;height:100%;border-radius:3px}
+.cval{flex:0 0 52px;text-align:right;font-weight:600}
+pre.detail{background:#f7f9fe;border:1px solid #e4e8f5;border-radius:8px;
+ padding:11px 13px;font-size:12.5px;white-space:pre-wrap;word-break:break-word;
+ font-family:inherit;color:#3a4160;margin:6px 0 0}
+footer{margin-top:44px;padding-top:14px;border-top:1px solid #dbe2f5;
+ color:#8a93ad;font-size:12px;text-align:center}
+@media print{
+ body{background:#fff}
+ .wrap{max-width:none;padding:0}
+ header{border:none;background:#fff;border-bottom:2px solid #dbe2f5;border-radius:0}
+ .card,.metric{break-inside:avoid;border-color:#ccc}
+ h2{break-after:avoid}
+}
+</style></head><body><div class='wrap'><header><div class='ring' style='background:conic-gradient(#2a5fb4 74%, #e4e8f5 0)'><div class='ring-in'><b>74</b><span>良好</span></div></div><div style='flex:1;min-width:240px'><h1>开机体检报告</h1><p class='muted' style='margin:0'>Microsoft Windows 10 企业版 ｜ 内存 95.7 GB ｜ 上次开机 2026-11-22 03:32:11</p><p class='muted' style='margin:4px 0 0'>体检时间 2026-11-22 08:08:51 ｜ 开机体检大师 v1.8.0</p></div></header><div class='metrics'><div class='metric'><div class='k'>上次开机耗时</div><div class='v'>64 秒</div></div><div class='metric'><div class='k'>健康分</div><div class='v'>74 / 100</div></div><div class='metric'><div class='k'>高 / 中风险</div><div class='v'>1 / 1</div></div><div class='metric'><div class='k'>自启项</div><div class='v'>9 个</div></div><div class='metric'><div class='k'>自动服务</div><div class='v'>119 个</div></div><div class='metric'><div class='k'>C 盘剩余</div><div class='v'>183 GB</div></div></div><h2>开机耗时趋势</h2><div class='chart'><div class='crow'><span class='ctime'>2026-09-04 14:08</span><span class='cbar'><i style='width:100%;background:#c23b31'></i></span><span class='cval' style='color:#c23b31'>107 秒</span></div><div class='crow'><span class='ctime'>2026-09-06 12:17</span><span class='cbar'><i style='width:80%;background:#d08a1a'></i></span><span class='cval' style='color:#d08a1a'>86 秒</span></div><div class='crow'><span class='ctime'>2026-09-06 18:14</span><span class='cbar'><i style='width:71%;background:#d08a1a'></i></span><span class='cval' style='color:#d08a1a'>77 秒</span></div><div class='crow'><span class='ctime'>2026-09-07 12:52</span><span class='cbar'><i style='width:92%;background:#c23b31'></i></span><span class='cval' style='color:#c23b31'>99 秒</span></div><div class='crow'><span class='ctime'>2026-09-09 19:32</span><span class='cbar'><i style='width:79%;background:#d08a1a'></i></span><span class='cval' style='color:#d08a1a'>85 秒</span></div><div class='crow'><span class='ctime'>2026-11-03 15:05</span><span class='cbar'><i style='width:71%;background:#d08a1a'></i></span><span class='cval' style='color:#d08a1a'>76 秒</span></div><div class='crow'><span class='ctime'>2026-11-03 17:02</span><span class='cbar'><i style='width:61%;background:#d08a1a'></i></span><span class='cval' style='color:#d08a1a'>66 秒</span></div><div class='crow'><span class='ctime'>2026-11-04 14:16</span><span class='cbar'><i style='width:69%;background:#d08a1a'></i></span><span class='cval' style='color:#d08a1a'>74 秒</span></div><div class='crow'><span class='ctime'>2026-11-21 02:40</span><span class='cbar'><i style='width:39%;background:#157a4f'></i></span><span class='cval' style='color:#157a4f'>42 秒</span></div><div class='crow'><span class='ctime'>2026-11-21 15:25</span><span class='cbar'><i style='width:59%;background:#d08a1a'></i></span><span class='cval' style='color:#d08a1a'>64 秒</span></div></div><p class='muted'>最近 10 次开机，平均 77 秒（目标 &lt; 60 秒）</p><h2>流氓软件 / 全家桶 <span class='badge'>1 项</span></h2><p class='muted'>比对特征库：目录名 1126 条 · 签名主体 398 条 · 厂商家族 10 组（更新于 2026-11-22）</p><div class='card' style='border-left:4px solid #c23b31'><div class='cardhead'><b>2345 全家桶</b><span class='tag' style='color:#c23b31;background:#fdeae7'>高</span></div><p class='why'>浏览器 / 看图王 / 好压 / 安全卫士互相捆绑，主页劫持高发。</p><table class='tbl'><tr><th>名称</th><th>来源</th><th>说明</th></tr><tr><td>看图王 - 2345</td><td>已安装</td><td class='muted'>2345移动科技</td></tr></table><p class='cmd'>卸载命令：<code>C:\Program Files\2345Soft\2345Pic\Uninstall.exe</code></p></div><h2>问题清单 <span class='badge'>28 项</span></h2><h3>启动速度 <span class='badge'>3</span></h3><div class='card' style='border-left:4px solid #96600a'><div class='cardhead'><b>上次开机耗时 64 秒</b><span class='tag' style='color:#96600a;background:#fdf4e4'>中</span></div><p class='muted' style='margin:0 0 6px'>系统启动性能日志</p><pre class='detail'>最近一次开机（2026-11-21 15:25）：总耗时 64 秒。
+· 登录阶段（用户配置 12 秒 + 桌面加载 23 秒）：35 秒
+· 桌面出现后的后台收尾：12 秒
+
+处理下方『快速启动 / 开机自启 / 服务与残留』里的问题后，再体检对比效果。</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>近几次开机平均 64 秒（共 10 条记录）</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>用于对比优化效果</p><pre class='detail'>历史记录（最近在前）：
+· 2026-11-21 15:25 — 64 秒
+· 2026-11-21 02:40 — 42 秒
+· 2026-11-04 14:16 — 74 秒
+· 2026-11-03 17:02 — 66 秒
+· 2026-11-03 15:05 — 76 秒
+· 2026-09-09 19:32 — 85 秒
+· 2026-09-07 12:52 — 99 秒
+· 2026-09-06 18:14 — 77 秒
+· 2026-09-06 12:17 — 86 秒
+· 2026-09-04 14:08 — 107 秒</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>反复出现在『启动缓慢』记录里的程序</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>8 个</p><pre class='detail'>这些程序在近几次开机中多次被系统标记为启动较慢：
+· douyin.exe
+· wetype_server.exe
+· wetype_update.exe
+· HipsDaemon.exe
+· atkexComSvc.exe
+· AdguardSvc.exe
+· RGSUpdaterAgent.exe
+· explorer.exe
+
+不一定都要关闭，如果你的工作流不需要它们常驻，可考虑处理。</pre></div><h3>流氓软件 <span class='badge'>1</span></h3><div class='card' style='border-left:4px solid #c23b31'><div class='cardhead'><b>2345 全家桶：1 项</b><span class='tag' style='color:#c23b31;background:#fdeae7'>高</span></div><p class='muted' style='margin:0 0 6px'>看图王 - 2345</p><pre class='detail'>命中特征库：浏览器 / 看图王 / 好压 / 安全卫士互相捆绑，主页劫持高发。
+
+已安装：
+  · 看图王 - 2345（2345移动科技）
+
+建议：这类软件通常是「装一个带一串」，卸载本体后残留的启动项与服务仍会随开机加载。建议先在「设置 → 应用」里正常卸载，再回来体检清理残留。</pre></div><h3>延迟启动 <span class='badge'>19</span></h3><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>Adguard</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>按顶部时长重新登记</p><pre class='detail'>按顶部『延迟时长』重新登记该任务（覆盖原任务）。
+
+命令：C:\Program Files\Adguard\Adguard.exe /nosplash
+任务名：BootDoctor-Delay-Adguard
+当前延迟：1 分钟
+
+应用名称：AdGuard for Windows · Adguard.exe
+文件路径：C:\Program Files\Adguard\Adguard.exe
+文件说明：AdGuard for Windows
+公司：Adguard Software Limited
+产品：AdGuard for Windows
+版本：7.22.5282.0
+启动参数：/nosplash
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>AsioReg</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>按顶部时长重新登记</p><pre class='detail'>按顶部『延迟时长』重新登记该任务（覆盖原任务）。
+
+命令：REGSVR32 /S CTASIO.DLL
+任务名：BootDoctor-Delay-AsioReg
+当前延迟：1 分钟
+
+应用名称：REGSVR32.exe → CTASIO.DLL
+文件路径：C:\WINDOWS\System32\REGSVR32.exe
+文件说明：Microsoft(C) 注册服务器
+公司：Microsoft Corporation
+产品：Microsoft® Windows® Operating System
+版本：10.0.19041.4522 (WinBuild.160101.0800)
+启动参数：/S CTASIO.DLL
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>AsioThk32Reg（已禁用）</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>按顶部时长重新登记</p><pre class='detail'>按顶部『延迟时长』重新登记该任务（覆盖原任务）。
+
+命令：REGSVR32.EXE /S CTASIO.DLL
+任务名：BootDoctor-Delay-AsioThk32Reg
+当前延迟：1 分钟
+当前状态：已禁止（执行后会重新启用）
+
+应用名称：REGSVR32.exe → CTASIO.DLL
+文件路径：C:\WINDOWS\System32\REGSVR32.exe
+文件说明：Microsoft(C) 注册服务器
+公司：Microsoft Corporation
+产品：Microsoft® Windows® Operating System
+版本：10.0.19041.4522 (WinBuild.160101.0800)
+启动参数：/S CTASIO.DLL
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>CloudDriveDesktopWidgetIndependent</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>按顶部时长重新登记</p><pre class='detail'>按顶部『延迟时长』重新登记该任务（覆盖原任务）。
+
+命令：D:\HRSoftstore\Install\kuakewangpan\QuarkCloudDrive\components\clouddrive_desktop_widget_independent\clouddrive_desktop_widget_independent.exe --autostart
+任务名：BootDoctor-Delay-CloudDriveDesktopWidgetIndependent
+当前延迟：1 分钟
+
+应用名称：夸克网盘Lite · clouddrive_desktop_widget_independent.exe
+文件路径：D:\HRSoftstore\Install\kuakewangpan\QuarkCloudDrive\components\clouddrive_desktop_widget_independent\clouddrive_desktop_widget_independent.exe
+文件说明：夸克网盘Lite
+公司：The Quark Authors
+产品：夸克网盘Lite
+版本：2.1.3
+启动参数：--autostart
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>DesktopTidy.lnk</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>按顶部时长重新登记</p><pre class='detail'>按顶部『延迟时长』重新登记该任务（覆盖原任务）。
+
+命令：C:\Users\Administrator\AppData\Local\Programs\Python\Python310\pythonw.exe &quot;E:\jiaoben\pojia\desktop_tidy\main.py&quot; --startup
+任务名：BootDoctor-Delay-DesktopTidy.lnk
+当前延迟：1 分钟
+
+应用名称：Python · pythonw.exe
+文件路径：C:\Users\Administrator\AppData\Local\Programs\Python\Python310\pythonw.exe
+文件说明：Python
+公司：Python Software Foundation
+产品：Python
+版本：3.10.4
+启动参数：&quot;E:\jiaoben\pojia\desktop_tidy\main.py&quot; --startup
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>Everything</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>按顶部时长重新登记</p><pre class='detail'>按顶部『延迟时长』重新登记该任务（覆盖原任务）。
+
+命令：D:/Program Files\Everything\Everything.exe -startup
+任务名：BootDoctor-Delay-Everything
+当前延迟：1 分钟
+
+应用名称：Everything.exe
+文件路径：D:/Program Files\Everything\Everything.exe
+文件说明：Everything
+公司：voidtools
+产品：Everything
+版本：1.4.1.1032
+启动参数：-startup
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>IDMan</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>按顶部时长重新登记</p><pre class='detail'>按顶部『延迟时长』重新登记该任务（覆盖原任务）。
+
+命令：C:\Program Files (x86)\Internet Download Manager\IDMan.exe /onboot
+任务名：BootDoctor-Delay-IDMan
+当前延迟：1 分钟
+
+应用名称：Internet Download Manager (IDM) · IDMan.exe
+文件路径：C:\Program Files (x86)\Internet Download Manager\IDMan.exe
+文件说明：Internet Download Manager (IDM)
+公司：Tonec Inc.
+产品：Internet Download Manager (IDM)
+版本：6, 43, 18, 3
+启动参数：/onboot
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>PowerShadow</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>按顶部时长重新登记</p><pre class='detail'>按顶部『延迟时长』重新登记该任务（覆盖原任务）。
+
+命令：C:\Program Files (x86)\PowerShadow\App\PowerRemind.exe 
+任务名：BootDoctor-Delay-PowerShadow
+当前延迟：1 分钟
+
+应用名称：PowerRemind.exe
+文件路径：C:\Program Files (x86)\PowerShadow\App\PowerRemind.exe
+公司：北京坚果比特科技有限公司
+产品：影子系统PowerShadow2011
+版本：5.0.0.0
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>RadminVPN</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>按顶部时长重新登记</p><pre class='detail'>按顶部『延迟时长』重新登记该任务（覆盖原任务）。
+
+命令：C:\Program Files (x86)\Radmin VPN\RvRvpnGui.exe /minimized
+任务名：BootDoctor-Delay-RadminVPN
+当前延迟：1 分钟
+
+应用名称：Radmin VPN · RvRvpnGui.exe
+文件路径：C:\Program Files (x86)\Radmin VPN\RvRvpnGui.exe
+文件说明：Radmin VPN
+公司：Famatech Corp.
+产品：Radmin VPN
+版本：2.1.4951.1
+启动参数：/minimized
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>RazerAppEngine</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>按顶部时长重新登记</p><pre class='detail'>按顶部『延迟时长』重新登记该任务（覆盖原任务）。
+
+命令：C:\Program Files\Razer\RazerAppEngine\RazerAppEngine.exe --url-params=apps=synapse,chroma-app --launch-force-hidden=synapse,chroma-app --autoStart=1
+任务名：BootDoctor-Delay-RazerAppEngine
+当前延迟：1 分钟
+
+应用名称：RazerAppEngineLauncher.exe · RazerAppEngine.exe
+文件路径：C:\Program Files\Razer\RazerAppEngine\RazerAppEngine.exe
+文件说明：RazerAppEngineLauncher.exe
+公司：Razer Inc.
+产品：RazerAppEngineLauncher.exe
+版本：1.0.39.0
+启动参数：--url-params=apps=synapse,chroma-app --launch-force-hidden=synapse,chroma-app --autoStart=1
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>SakuraLauncher_8a49d589b8997c26e5fe8ca0c8308d23.lnk（已禁用）</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>按顶部时长重新登记</p><pre class='detail'>按顶部『延迟时长』重新登记该任务（覆盖原任务）。
+
+命令：C:\Program Files\SakuraFrpLauncher\SakuraLauncher.exe --minimize
+任务名：BootDoctor-Delay-SakuraLauncher_8a49d589b8997c26e5fe8ca0c8308d23.lnk
+当前延迟：1 分钟
+当前状态：已禁止（执行后会重新启用）
+
+应用名称：SakuraFrp Launcher · SakuraLauncher.exe
+文件路径：C:\Program Files\SakuraFrpLauncher\SakuraLauncher.exe
+文件说明：SakuraFrp Launcher
+产品：SakuraFrp Windows 启动器界面
+版本：3.2.0.2
+启动参数：--minimize
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>VStart6</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>按顶部时长重新登记</p><pre class='detail'>按顶部『延迟时长』重新登记该任务（覆盖原任务）。
+
+命令：C:\Program Files (x86)\VStart6\VStart6.exe 
+任务名：BootDoctor-Delay-VStart6
+当前延迟：1 分钟
+
+应用名称：http://www.3LSoft.com · VStart6.exe
+文件路径：C:\Program Files (x86)\VStart6\VStart6.exe
+文件说明：http://www.3LSoft.com
+公司：Shanghai Gaoxin Computer Systems Limited
+产品：VStart
+版本：6.00.0002
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>XmAutoDecrypt</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>按顶部时长重新登记</p><pre class='detail'>按顶部『延迟时长』重新登记该任务（覆盖原任务）。
+
+命令：E:\jiaoben\pojia\ximalaya_xm\venv\Scripts\pythonw.exe &quot;E:\jiaoben\pojia\ximalaya_xm\tool\xm_autodecrypt.py&quot;
+任务名：BootDoctor-Delay-XmAutoDecrypt
+当前延迟：1 分钟
+
+应用名称：Python · pythonw.exe
+文件路径：E:\jiaoben\pojia\ximalaya_xm\venv\Scripts\pythonw.exe
+文件说明：Python
+公司：Python Software Foundation
+产品：Python
+版本：3.10.4
+启动参数：&quot;E:\jiaoben\pojia\ximalaya_xm\tool\xm_autodecrypt.py&quot;
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #2a5fb4'><div class='cardhead'><b>服务：Tailscale</b><span class='tag' style='color:#2a5fb4;background:#e8f0fd'>低</span></div><p class='muted' style='margin:0 0 6px'>延迟加载（仍会启动）</p><pre class='detail'>把『Tailscale』改为『自动（延迟启动）』：系统启动完成后再拉起，功能照常。
+
+写法：服务的 DelayedAutoStart=1，不建计划任务；随时可还原。
+服务路径：&quot;C:\Program Files\Tailscale\tailscaled.exe&quot;
+
+应用名称：Tailscale service · tailscaled.exe
+文件路径：C:\Program Files\Tailscale\tailscaled.exe
+文件说明：Tailscale service
+公司：Tailscale Inc.
+产品：Tailscale
+版本：1.104.7-tfb3b9b296-g0651cc45e
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>自启项：magpie</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>登录后约 3 分钟 启动</p><pre class='detail'>把『magpie』（用户 Run）改为延迟启动：登录约 3 分钟 后再自动启动。
+
+实现：创建带延迟的登录计划任务，并关闭原来的自启标记（随时可还原）。
+
+命令：&quot;D:\uncle-novel\downloads\xsxz\magpie-windows-amd64_2.exe&quot; tray
+
+应用名称：magpie · magpie-windows-amd64_2.exe
+文件路径：D:\uncle-novel\downloads\xsxz\magpie-windows-amd64_2.exe
+文件说明：magpie
+公司：magpie
+产品：magpie
+版本：0.1.4657
+启动参数：tray
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>自启项：kX Mixer</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>登录后约 3 分钟 启动</p><pre class='detail'>把『kX Mixer』（系统 Run）改为延迟启动：登录约 3 分钟 后再自动启动。
+
+实现：创建带延迟的登录计划任务，并关闭原来的自启标记（随时可还原）。
+
+命令：&quot;C:\Program Files (x86)\kX Project\kxmixer.exe&quot; --startup
+
+应用名称：kX mixer · kxmixer.exe
+文件路径：C:\Program Files (x86)\kX Project\kxmixer.exe
+文件说明：kX mixer
+公司：Eugene Gavrilov
+产品：kX mixer
+版本：5, 10, 00, 3552 - debug
+启动参数：--startup
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>自启项：vmware-tray.exe</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>登录后约 3 分钟 启动</p><pre class='detail'>把『vmware-tray.exe』（系统 Run (32位)）改为延迟启动：登录约 3 分钟 后再自动启动。
+
+实现：创建带延迟的登录计划任务，并关闭原来的自启标记（随时可还原）。
+
+命令：&quot;C:\Program Files (x86)\VMware\VMware Workstation\vmware-tray.exe&quot;
+
+应用名称：VMware Tray Process · vmware-tray.exe
+文件路径：C:\Program Files (x86)\VMware\VMware Workstation\vmware-tray.exe
+文件说明：VMware Tray Process
+公司：VMware, Inc.
+产品：VMware Workstation
+版本：16.1.2 build-17966106
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>自启项：QTTabBar Desktop Extension StartUp.QTTabGroup</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>登录后约 3 分钟 启动</p><pre class='detail'>把『QTTabBar Desktop Extension StartUp.QTTabGroup』（用户启动文件夹）改为延迟启动：登录约 3 分钟 后再自动启动。
+
+实现：创建带延迟的登录计划任务，并关闭原来的自启标记（随时可还原）。
+
+命令：C:\Users\Administrator\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\QTTabBar Desktop Extension StartUp.QTTabGroup
+
+应用名称：QTTabBar Desktop Extension StartUp.QTTabGroup
+文件路径：C:\Users\Administrator\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\QTTabBar Desktop Extension StartUp.QTTabGroup
+文件状态：存在</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>自启项：Tailscale.lnk</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>登录后约 3 分钟 启动</p><pre class='detail'>把『Tailscale.lnk』（公共启动文件夹）改为延迟启动：登录约 3 分钟 后再自动启动。
+
+实现：创建带延迟的登录计划任务，并关闭原来的自启标记（随时可还原）。
+
+命令：C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\Tailscale.lnk
+
+应用名称：Tailscale GUI client · tailscale-ipn.exe
+文件路径：C:\Program Files\Tailscale\tailscale-ipn.exe
+文件说明：Tailscale GUI client
+公司：Tailscale Inc.
+产品：Tailscale
+版本：1.104.7-tfb3b9b296-g0651cc45e
+文件状态：存在</pre></div><h3>服务与残留 <span class='badge'>2</span></h3><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>8 个服务指向的文件已不存在</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>需人工确认</p><pre class='detail'>这些服务指向的文件找不到了（可能是卸载不干净的软件）。删除服务键前建议确认你不再需要它：
+
+· ACE-CORE102723 -&gt; C:\Program Files\AntiCheatExpert\ACE-CORE102723.sys
+· COMMONFX.SYS -&gt; C:\WINDOWS\System32\drivers\COMMONFX.SYS
+· CTAUDFX.SYS -&gt; C:\WINDOWS\System32\drivers\CTAUDFX.SYS
+· CTERFXFX.SYS -&gt; C:\WINDOWS\System32\drivers\CTERFXFX.SYS
+· CTSBLFX.SYS -&gt; C:\WINDOWS\System32\drivers\CTSBLFX.SYS
+· Dokan2t -&gt; C:\Program Files\Tencent\Androws\Application\2.0.3059.0\Driver\dokan2t.sys
+· NEProtect -&gt; E:\FeverApps\QRSJ\NEProtect.sys
+· NvFsFilter -&gt; C:\Windows\System32\drivers\nvfsflt64.sys</pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>自动启动但当前未运行的服务：10 个</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>多为按需/守护型</p><pre class='detail'>这些服务设为自动但当前没在跑（可能是延迟启动、按需启动或启动失败）：
+
+· asus、AsusROGLSLService、AsusUpdateCheck、edgeupdate、Edrservice、EgoUpdaterInternalService0.6.3.14、EgoUpdaterService0.6.3.14、GoogleUpdaterInternalService159.0.8140.0、GoogleUpdaterService159.0.8140.0、sppsvc</pre></div><h3>开机报错 <span class='badge'>2</span></h3><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>开机时有驱动/服务加载失败记录</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>近 7 天 11 条</p><pre class='detail'>相关信息（360 / luafv 等已在上方合并处理）：
+
+· [11-22 03:32 7026] The following boot-start or system-start driver(s) did not load: </pre></div><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>有服务异常退出记录：10 条</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>近 7 天</p><pre class='detail'>· [11-22 03:31] The VMware Workstation Server service terminated unexpectedly.  It has done this 1 time(s).  The following corrective ac
+· [11-21 04:57] The VMware Workstation Server service terminated unexpectedly.  It has done this 1 time(s).  The following corrective ac
+· [11-21 02:37] The VMware Workstation Server service terminated unexpectedly.  It has done this 1 time(s).  The following corrective ac
+· [11-20 16:05] The VMware Workstation Server service terminated unexpectedly.  It has done this 1 time(s).  The following corrective ac
+· [11-20 16:03] The VMware Workstation Server service terminated unexpectedly.  It has done this 1 time(s).  The following corrective ac
+· [11-19 05:11] The VMware Workstation Server service terminated unexpectedly.  It has done this 1 time(s).  The following corrective ac
+· [11-18 04:13] The VMware Workstation Server service terminated unexpectedly.  It has done this 1 time(s).  The following corrective ac
+· [11-17 07:12] The VMware Workstation Server service terminated unexpectedly.  It has done this 1 time(s).  The following corrective ac
+· [11-16 03:40] The VMware Workstation Server service terminated unexpectedly.  It has done this 1 time(s).  The following corrective ac
+· [11-16 00:47] The VMware Workstation Server service terminated unexpectedly.  It has done this 1 time(s).  The following corrective ac</pre></div><h3>磁盘与其他 <span class='badge'>1</span></h3><div class='card' style='border-left:4px solid #6d7695'><div class='cardhead'><b>BIOS / 固件层优化建议（可选）</b><span class='tag' style='color:#6d7695;background:#eef1fa'>提示</span></div><p class='muted' style='margin:0 0 6px'>系统内无法自动处理</p><pre class='detail'>开机总耗时里有一段（约 30~70 秒）发生在 Windows 启动之前（BIOS/POST 阶段），系统内无法优化。如果在意，可进 BIOS：
+· 开启 Fast Boot / 快速启动
+· 关闭未使用的控制器、PXE 网络启动
+· 精简启动顺序（多硬盘时尤其明显）
+
+本项仅供了解，无需在系统内做任何操作。</pre></div><footer>由 开机体检大师 v1.8.0 生成 ｜ 所有修复均先备份，可在「操作 → 还原备份」回退</footer></div></body></html>
