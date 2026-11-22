@@ -286,6 +286,8 @@ class Guard(QApplication):
     def check_processes(self):
         """对比进程列表：第一次只建基线（守护启动前就在跑的不报），之后出现的新进程逐个判定。"""
         self.reload_rules()          # 开关改了立即生效：规则文件没变时只是一次 stat，几乎没有开销
+        if bc.adware_db_reload_if_changed():     # 主程序自动更新了特征库：守护不用重启就用上新库
+            glog("特征库文件已更新，已重新加载")
         if self.paused or not self.rules.get("watch_process", True):
             return
         try:
@@ -502,6 +504,8 @@ class Guard(QApplication):
         if self.paused and not force:
             return
         self.reload_rules()                  # 规则可能被主程序改过
+        if bc.adware_db_reload_if_changed():
+            glog("特征库文件已更新，已重新加载")
         want = self.poll_interval()
         if self.timer.interval() != want:
             self.timer.setInterval(want)

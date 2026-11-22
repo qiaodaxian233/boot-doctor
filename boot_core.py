@@ -675,6 +675,8 @@ def diff_snapshot(old, new):
 
 ADWARE_DB_PATH = os.environ.get("BOOTDOC_ADWARE_DB") or os.path.join(BASE_DIR, "adware_db.json")
 _ADB = {}
+_ADB_MTIME = [0.0]          # 加载时特征库文件的修改时间：长期运行的守护进程靠它发现库被更新了
+DB_AUTO_HOURS = 20          # 自动更新的最小间隔（小时）
 
 
 def adware_db():
@@ -744,7 +746,34 @@ def adware_db():
     d["_white"] = {str(w).strip("\\").strip().lower()
                    for w in (d.get("white") or []) if str(w).strip()}
     _ADB.update(d)
+    try:
+        _ADB_MTIME[0] = os.path.getmtime(ADWARE_DB_PATH)
+    except OSError:
+        _ADB_MTIME[0] = 0.0
     return _ADB
+
+
+def adware_db_reload_if_changed():
+    """特征库文件在磁盘上变了（别的进程更新了它）就丢掉内存里的副本，下次使用时重新加载。
+
+    守护进程是长期运行的：不做这一步，主程序自动更新了特征库，守护还在用启动时加载的旧库。
+    没加载过 / 没变化时只是一次 stat。返回是否触发了重新加载。
+    """
+    try:
+        mt = os.path.getmtime(ADWARE_DB_PATH)
+    except OSError:
+        return False
+    if _ADB and _ADB_MTIME[0] and mt != _ADB_MTIME[0]:
+        _ADB.clear()
+        return True
+    return False
+
+
+def db_auto_due(now=None, last=None, hours=None):
+    """距离上次成功检查特征库是否已经过了足够久（默认 20 小时）。"""
+    now = time.time() if now is None else now
+    last = float(get_setting("db_checked_at", 0) or 0) if last is None else float(last or 0)
+    return now - last >= (DB_AUTO_HOURS if hours is None else hours) * 3600
 
 
 def adware_db_stats():

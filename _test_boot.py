@@ -3203,6 +3203,35 @@ class TestProcWatchE2E(_GuardE2EBase):
         for b in before_alive:
             self.assertIsNone(b.poll(), "开自动结束之前就在运行的进程被追杀了")
 
+    def test_d_db_reloaded_without_restart(self):
+        """主程序自动更新了特征库文件：长期运行的守护不用重启就该用上新库（换成不匹配的库 → 不再提醒；换回来 → 又提醒）。"""
+        import time as _t
+        rules = dict(self.rules, watch_process=True, auto_kill_adware=False)
+        self.assertTrue(bc.save_popup_rules(rules))
+        os.utime(bc.POPUP_RULES_PATH, (_t.time() + 20, _t.time() + 20))
+        db = os.environ["BOOTDOC_ADWARE_DB"]
+        original = open(db, encoding="utf-8").read()
+        _t.sleep(3.2)
+        try:
+            with open(db, "w", encoding="utf-8") as fp:
+                json.dump({"version": 3, "dirs": {"zzzzunmatched": "x"}, "pubs": [], "families": [], "white": []}, fp)
+            os.utime(db, (_t.time() + 30, _t.time() + 30))
+            _t.sleep(3.5)
+            n0 = len(self._rows_for())
+            self._spawn()
+            _t.sleep(5)
+            self.assertEqual(len(self._rows_for()), n0, "库换成不匹配的了，守护还在用旧库提醒")
+            with open(db, "w", encoding="utf-8") as fp:
+                fp.write(original)
+            os.utime(db, (_t.time() + 40, _t.time() + 40))
+            _t.sleep(3.5)
+            self._spawn()
+            self.assertTrue(self._wait(lambda: len(self._rows_for()) > n0), "库换回来了，守护没有重新加载。日志：\n" + self.log())
+            self.assertIn("特征库文件已更新，已重新加载", self.log())
+        finally:
+            with open(db, "w", encoding="utf-8") as fp:
+                fp.write(original)
+
     def test_c_master_switch_off(self):
         import time as _t
         rules = dict(self.rules, watch_process=False, auto_kill_adware=True)
@@ -3335,6 +3364,160 @@ class TestExtensionCheck(unittest.TestCase):
         f = next((x for x in res["findings"] if x["id"] == "hij_ext@Chrome"), None)
         self.assertIsNotNone(f)
         self.assertIn(f["fix"]["type"], bc.FIX_DESC)
+
+
+class TestDbAutoUpdate(unittest.TestCase):
+    def setUp(self):
+        self._saved_settings = {k: bc.get_setting(k, None) for k in ("db_checked_at", "auto_update_db")}
+        self._saved_adb = (dict(bc._ADB), bc._ADB_MTIME[0], bc.ADWARE_DB_PATH)
+        self.td = tempfile.mkdtemp()
+
+    def tearDown(self):
+        for k, v in self._saved_settings.items():
+            bc.set_setting(k, v if v is not None else (0 if k == "db_checked_at" else True))
+        adb, mt, path = self._saved_adb
+        bc.ADWARE_DB_PATH = path
+        bc._ADB.clear()
+        bc._ADB.update(adb)
+        bc._ADB_MTIME[0] = mt
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_due_logic(self):
+        import time as _t
+        now = _t.time()
+        self.assertTrue(bc.db_auto_due(now=now, last=0))
+        self.assertFalse(bc.db_auto_due(now=now, last=now - 3600))
+        self.assertFalse(bc.db_auto_due(now=now, last=now - 19 * 3600))
+        self.assertTrue(bc.db_auto_due(now=now, last=now - 21 * 3600))
+        bc.set_setting("db_checked_at", now - 100)
+        self.assertFalse(bc.db_auto_due())
+
+    def test_reload_if_changed(self):
+        import time as _t
+        dbp = os.path.join(self.td, "db.json")
+
+        def write(key, mt):
+            with open(dbp, "w", encoding="utf-8") as fp:
+                json.dump({"version": 1, "dirs": {key: "测试"}, "pubs": [], "families": [], "white": []}, fp)
+            os.utime(dbp, (mt, mt))
+        bc.ADWARE_DB_PATH = dbp
+        bc._ADB.clear()
+        write("aaaa1111", _t.time() - 100)
+        self.assertIn("aaaa1111", bc.adware_db()["_dir_lower"])
+        self.assertFalse(bc.adware_db_reload_if_changed(), "没变化不该重新加载")
+        write("bbbb2222", _t.time())
+        self.assertTrue(bc.adware_db_reload_if_changed())
+        self.assertIn("bbbb2222", bc.adware_db()["_dir_lower"])
+        self.assertNotIn("aaaa1111", bc.adware_db()["_dir_lower"])
+        self.assertFalse(bc.adware_db_reload_if_changed())
+
+    def test_never_loaded_or_missing_is_safe(self):
+        bc._ADB.clear()
+        self.assertFalse(bc.adware_db_reload_if_changed())
+        bc.ADWARE_DB_PATH = os.path.join(self.td, "nope.json")
+        self.assertFalse(bc.adware_db_reload_if_changed())
+
+    def _window(self, rep):
+        from PyQt5.QtCore import QObject, pyqtSignal
+        from PyQt5.QtWidgets import QApplication
+        import boot_doctor as bd
+        self.app = QApplication.instance() or QApplication([])
+        created = []
+
+        class FakeW(QObject):
+            sig_progress = pyqtSignal(str)
+            sig_done = pyqtSignal(object)
+            sig_fail = pyqtSignal(str)
+
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                created.append(self)
+
+            def start(self):
+                self.sig_done.emit(rep)
+
+            def isRunning(self):
+                return False
+        self._old_worker = bd.DbUpdateWorker
+        bd.DbUpdateWorker = FakeW
+        self._bd = bd
+        win = bd.MainWindow(autoscan=False)
+        scans = []
+        win.start_scan = lambda: scans.append(1)
+        return win, created, scans
+
+    def _pump(self):
+        for _ in range(4):
+            self.app.processEvents()
+
+    def test_gui_flow(self):
+        import time as _t
+        from PyQt5.QtWidgets import QMessageBox
+        old_boxes = (QMessageBox.warning, QMessageBox.information, QMessageBox.critical, QMessageBox.question)
+        boom = staticmethod(lambda *a, **k: (_ for _ in ()).throw(AssertionError("自动更新不该弹窗")))
+        QMessageBox.warning = QMessageBox.information = QMessageBox.critical = QMessageBox.question = boom
+        try:
+            # 1) 真实启动之外（autoscan=False）：到期了也不联网
+            win, created, scans = self._window({"ok": True, "up_to_date": True, "version": 2})
+            try:
+                bc.set_setting("auto_update_db", True)
+                bc.set_setting("db_checked_at", 0)
+                win._maybe_auto_update_db(0)
+                self._pump()
+                self.assertEqual(created, [], "测试窗口不该联网")
+                # 2) 已是最新：记下检查时间，不重新体检
+                win._auto_checks = True
+                win._maybe_auto_update_db(0)
+                self._pump()
+                self.assertEqual(len(created), 1)
+                self.assertGreater(float(bc.get_setting("db_checked_at", 0)), _t.time() - 10)
+                self.assertEqual(scans, [])
+                # 同一次启动最多试一次
+                win._maybe_auto_update_db(0)
+                self._pump()
+                self.assertEqual(len(created), 1)
+            finally:
+                win.close()
+            # 3) 有新条目：状态栏提示 + 重新体检
+            win, created, scans = self._window({"ok": True, "up_to_date": False, "version": 3, "added_dirs": 3,
+                                                "added_pubs": 1, "source": "x", "updated": "2026-11-22"})
+            try:
+                win._auto_checks = True
+                bc.set_setting("db_checked_at", 0)
+                win._maybe_auto_update_db(0)
+                self._pump()
+                self.assertEqual(scans, [1], "有新条目应重新体检一次")
+                self.assertIn("新增 3", win.statusBar().currentMessage())
+            finally:
+                win.close()
+            # 4) 失败：不弹窗、不记「已检查」（下次启动再试）
+            win, created, scans = self._window({"ok": False, "error": "没网"})
+            try:
+                win._auto_checks = True
+                bc.set_setting("db_checked_at", 0)
+                win._maybe_auto_update_db(0)
+                self._pump()
+                self.assertEqual(len(created), 1)
+                self.assertEqual(float(bc.get_setting("db_checked_at", 0)), 0.0)
+                self.assertEqual(scans, [])
+            finally:
+                win.close()
+            # 5) 没到期 / 设置里关了：不联网
+            win, created, scans = self._window({"ok": True, "up_to_date": True, "version": 2})
+            try:
+                win._auto_checks = True
+                bc.set_setting("db_checked_at", _t.time())
+                win._maybe_auto_update_db(0)
+                bc.set_setting("db_checked_at", 0)
+                bc.set_setting("auto_update_db", False)
+                win._maybe_auto_update_db(0)
+                self._pump()
+                self.assertEqual(created, [])
+            finally:
+                win.close()
+        finally:
+            QMessageBox.warning, QMessageBox.information, QMessageBox.critical, QMessageBox.question = old_boxes
+            self._bd.DbUpdateWorker = self._old_worker
 
 
 if __name__ == "__main__":
