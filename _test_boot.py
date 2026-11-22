@@ -1848,5 +1848,315 @@ class TestLauncher(unittest.TestCase):
         self.assertRegex(m[0].lower(), r"pythonw?\.exe\]|pyw(\.exe)?\]", txt[-500:])
 
 
+def _make_lnk(path, target, args="", workdir=""):
+    """用 COM 造一个真的 .lnk（测试夹具）。"""
+    env = dict(os.environ, BD_P=path, BD_T=target, BD_A=args, BD_W=workdir)
+    out = bc.run_ps("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:BD_P);"
+                    "$s.TargetPath=$env:BD_T;$s.Arguments=$env:BD_A;"
+                    "if($env:BD_W){$s.WorkingDirectory=$env:BD_W};$s.Save();'OK'", timeout=60, env=env)
+    assert "OK" in out, "造 lnk 失败：%r" % out
+
+
+def _com_read_lnk(path):
+    env = dict(os.environ, BD_P=path)
+    out = bc.run_ps("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:BD_P);"
+                    "Write-Output ($s.TargetPath+[char]9+$s.Arguments)", timeout=60, env=env)
+    parts = out.strip("\r\n").split("\t")
+    return parts[0], (parts[1] if len(parts) > 1 else "")
+
+
+class TestLnkParser(unittest.TestCase):
+    """原生 .lnk 解析必须和 COM（WScript.Shell）读出来的一致，否则体检里的应用识别会走偏。"""
+
+    def test_matches_com(self):
+        np = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "notepad.exe")
+        cases = [(np, ""), (np, "a b"), (sys.executable, '--x "C:\\Temp\\y z" https://a.b/c?d=1')]
+        with tempfile.TemporaryDirectory() as td:
+            for i, (tgt, args) in enumerate(cases):
+                lnk = os.path.join(td, "t%d.lnk" % i)
+                _make_lnk(lnk, tgt, args)
+                nat = bc.parse_lnk(lnk)
+                self.assertIsNotNone(nat, "解析不出来：%s" % lnk)
+                ct, ca = _com_read_lnk(lnk)
+                self.assertEqual(os.path.normcase(nat["target"]), os.path.normcase(ct), lnk)
+                self.assertEqual(nat["args"], ca)
+
+    def test_unicode_name_and_bulk_without_powershell(self):
+        """中文文件名 + 批量解析走原生：把 run_ps 换成会抛异常的，也必须解析成功。"""
+        with tempfile.TemporaryDirectory() as td:
+            lnk = os.path.join(td, "谷歌浏览器.lnk")
+            _make_lnk(lnk, sys.executable, "--profile-directory=Default")
+            old = bc.run_ps
+            bc.run_ps = lambda *a, **k: (_ for _ in ()).throw(AssertionError("不该起 PowerShell"))
+            bc._LNK_CACHE.pop(lnk, None)
+            try:
+                self.assertEqual(bc.resolve_shortcuts_bulk([lnk]), 1)
+            finally:
+                bc.run_ps = old
+            tgt, args = bc._LNK_CACHE[lnk]
+            self.assertEqual(os.path.normcase(tgt), os.path.normcase(sys.executable))
+            self.assertEqual(args, "--profile-directory=Default")
+
+    def test_garbage_is_none(self):
+        self.assertIsNone(bc.parse_lnk_bytes(b""))
+        self.assertIsNone(bc.parse_lnk_bytes(b"x" * 200))
+        self.assertIsNone(bc.parse_lnk(os.path.join(tempfile.gettempdir(), "__no_such__.lnk")))
+
+
+class TestBrowserHijack(unittest.TestCase):
+    TESTKEY = r"Software\BootDoctorUnitTest\Hijack"
+
+    def setUp(self):
+        import winreg
+        self.wr = winreg
+        bc._delete_key_tree(winreg.HKEY_CURRENT_USER, r"Software\BootDoctorUnitTest")
+
+    def tearDown(self):
+        bc._delete_key_tree(self.wr.HKEY_CURRENT_USER, r"Software\BootDoctorUnitTest")
+
+    def _collect(self, d):
+        got = []
+        bc._hijack_findings(d, lambda **kw: got.append(kw))
+        return {f["id"]: f for f in got}
+
+    # ---------------- 采集 ----------------
+    def test_tcp_listeners_sees_my_socket(self):
+        import socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        try:
+            port = srv.getsockname()[1]
+            ls = bc.tcp_listeners()
+            self.assertIn(("127.0.0.1", port), ls)
+            self.assertEqual(ls[("127.0.0.1", port)], os.getpid())
+        finally:
+            srv.close()
+
+    def test_collect_hijack_real_machine(self):
+        import time as _t
+        t0 = _t.perf_counter()
+        d = bc.collect_hijack()
+        dt = _t.perf_counter() - t0
+        for k in ("managed", "proxy", "policies", "ie", "hosts", "lnks"):
+            self.assertIn(k, d)
+        self.assertTrue(d["hosts"].get("exists"), "找不到 hosts 文件")
+        self.assertLess(dt, 3.0, "采集太慢：%.2fs" % dt)
+        print("  collect_hijack %.0f ms, lnks=%d policies=%d" % (dt * 1000, len(d["lnks"]), len(d["policies"])))
+
+    def test_read_proxy_state_roundtrip(self):
+        base = bc._INET
+        old = bc.read_proxy_state()
+        try:
+            with self.wr.CreateKeyEx(self.wr.HKEY_CURRENT_USER, base, 0, self.wr.KEY_SET_VALUE) as k:
+                self.wr.SetValueEx(k, "ProxyEnable", 0, self.wr.REG_DWORD, 1)
+                self.wr.SetValueEx(k, "ProxyServer", 0, self.wr.REG_SZ, "127.0.0.1:1")
+            st = bc.read_proxy_state()
+            self.assertEqual((st["enable"], st["server"]), (1, "127.0.0.1:1"))
+        finally:
+            with self.wr.CreateKeyEx(self.wr.HKEY_CURRENT_USER, base, 0, self.wr.KEY_SET_VALUE) as k:
+                self.wr.SetValueEx(k, "ProxyEnable", 0, self.wr.REG_DWORD, int(old.get("enable") or 0))
+                if old.get("server"):
+                    self.wr.SetValueEx(k, "ProxyServer", 0, self.wr.REG_SZ, old["server"])
+                else:
+                    try:
+                        self.wr.DeleteValue(k, "ProxyServer")
+                    except OSError:
+                        pass
+
+    # ---------------- 分析 ----------------
+    def test_proxy_dead_vs_alive_vs_remote(self):
+        base = {"managed": False, "policies": [], "ie": [], "hosts": {}, "lnks": []}
+        dead = self._collect(dict(base, proxy={"enable": 1, "server": "127.0.0.1:7890"}, listeners=[]))
+        self.assertIn("hij_proxy_dead", dead)
+        self.assertEqual(dead["hij_proxy_dead"]["fix"]["items"][0]["name"], "ProxyEnable")
+        alive = self._collect(dict(base, proxy={"enable": 1, "server": "127.0.0.1:7890"},
+                                   listeners=[["0.0.0.0", 7890, os.getpid()]]))
+        self.assertIn("hij_proxy_local", alive)
+        self.assertNotIn("hij_proxy_dead", alive)
+        self.assertEqual(alive["hij_proxy_local"]["sev"], "info")
+        remote = self._collect(dict(base, proxy={"enable": 1, "server": "8.8.8.8:3128"}))
+        self.assertEqual(remote["hij_proxy_remote"]["sev"], "mid")
+        self.assertTrue(remote["hij_proxy_remote"]["fix"])
+        managed = self._collect(dict(base, managed=True, proxy={"enable": 1, "server": "8.8.8.8:3128"}))
+        self.assertEqual(managed["hij_proxy_remote"]["sev"], "info")
+        self.assertIsNone(managed["hij_proxy_remote"]["fix"], "受管理的电脑不该建议改代理")
+        off = self._collect(dict(base, proxy={"enable": 0, "server": "127.0.0.1:7890"}))
+        self.assertFalse([k for k in off if k.startswith("hij_proxy")], "代理没开就不该报")
+        pac = self._collect(dict(base, proxy={"enable": 0, "pac": "http://evil.example/p.pac"}))
+        self.assertIn("hij_pac", pac)
+
+    def test_policy_and_ie_findings(self):
+        pol = [{"browser": "Chrome", "hive": "HKLM", "subkey": r"SOFTWARE\Policies\Google\Chrome",
+                "name": "HomepageLocation", "value": "https://www.hao123.com/?tn=x"}]
+        base = {"proxy": {}, "hosts": {}, "lnks": [], "ie": []}
+        f = self._collect(dict(base, managed=False, policies=pol))["hij_policy@Chrome"]
+        self.assertEqual(f["sev"], "high", "导航站主页应报高危")
+        self.assertEqual(f["fix"]["items"][0]["action"], "delete")
+        f2 = self._collect(dict(base, managed=True, policies=pol))["hij_policy@Chrome"]
+        self.assertEqual(f2["sev"], "info")
+        self.assertIsNone(f2["fix"])
+        ie = self._collect(dict(base, managed=False, policies=[],
+                                ie=[{"name": "Start Page", "value": "http://www.2345.com/?x"},
+                                    {"name": "Search Page", "value": "https://www.bing.com"}]))
+        self.assertEqual([i["name"] for i in ie["hij_ie_start"]["fix"]["items"]], ["Start Page"])
+
+    def test_hosts_findings(self):
+        text = ("127.0.0.1 localhost\n127.0.0.1 update.microsoft.com\n"
+                "45.33.32.156 www.icbc.com.cn # x\n45.33.32.156 www.baidu.com\n140.82.112.3 github.com\n")
+        d = {"managed": False, "proxy": {}, "policies": [], "ie": [], "lnks": [],
+             "hosts": {"path": r"C:\x\hosts", "text": text, "database_path": ""}}
+        got = self._collect(d)
+        self.assertEqual({"hij_hosts_block", "hij_hosts_bank", "hij_hosts_popular", "hij_hosts_other"} & set(got),
+                         {"hij_hosts_block", "hij_hosts_bank", "hij_hosts_popular", "hij_hosts_other"})
+        self.assertIsNone(got["hij_hosts_other"].get("fix"), "github 加速这类不建议自动删")
+        self.assertEqual(got["hij_hosts_bank"]["sev"], "high")
+        d["hosts"]["database_path"] = r"D:\evil"
+        self.assertIn("hij_hosts_path", self._collect(d))
+        d["hosts"]["database_path"] = os.path.dirname(bc.HOSTS_PATH)
+        self.assertNotIn("hij_hosts_path", self._collect(d), "默认位置不该报")
+
+    def test_shortcut_scan_and_detect_real_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake_chrome = os.path.join(td, "chrome.exe")
+            shutil.copy(sys.executable, fake_chrome)
+            bad = os.path.join(td, "Google Chrome.lnk")
+            ok = os.path.join(td, "Microsoft Edge.lnk")
+            other = os.path.join(td, "Notepad.lnk")
+            _make_lnk(bad, fake_chrome, "https://www.hao123.com/?tn=x --profile-directory=Default")
+            _make_lnk(ok, fake_chrome, "--profile-directory=Default")
+            _make_lnk(other, os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                          "System32", "notepad.exe"))
+            found = {e["name"]: e for e in bc.scan_browser_shortcuts(roots=[(td, 1)])}
+            self.assertEqual(set(found), {"Google Chrome", "Microsoft Edge"}, "不相干的快捷方式不该进来")
+            r = bc.analyze_shortcut(found["Google Chrome"])
+            self.assertEqual((r["verdict"], r["sev"]), ("nav_url", "high"))
+            self.assertEqual(r["new_args"], "--profile-directory=Default", "只该去掉网址，别的参数留着")
+            self.assertIsNone(bc.analyze_shortcut(found["Microsoft Edge"]))
+
+    # ---------------- 处理：备份 → 执行 → 还原 ----------------
+    def _roundtrip(self, findings, td):
+        bdir = bc.make_backup(findings, backup_root=td, tag="ut")
+        res = bc.apply_fixes(findings, bdir)
+        self.assertTrue(all(r["ok"] for r in res), res)
+        return bdir
+
+    def test_reg_edit_backup_apply_restore(self):
+        W = self.wr
+        with W.CreateKeyEx(W.HKEY_CURRENT_USER, self.TESTKEY, 0, W.KEY_SET_VALUE) as k:
+            W.SetValueEx(k, "ProxyEnable", 0, W.REG_DWORD, 1)
+            W.SetValueEx(k, "ProxyServer", 0, W.REG_SZ, "127.0.0.1:7890")
+            W.SetValueEx(k, "Multi", 0, W.REG_MULTI_SZ, ["a", "b"])
+            W.SetValueEx(k, "Bin", 0, W.REG_BINARY, b"\x01\x02\xff")
+        items = [
+            {"hive": "HKCU", "subkey": self.TESTKEY, "name": "ProxyEnable", "action": "set", "type": W.REG_DWORD, "value": 0},
+            {"hive": "HKCU", "subkey": self.TESTKEY, "name": "ProxyServer", "action": "delete"},
+            {"hive": "HKCU", "subkey": self.TESTKEY, "name": "Multi", "action": "delete"},
+            {"hive": "HKCU", "subkey": self.TESTKEY, "name": "Bin", "action": "delete"},
+            {"hive": "HKCU", "subkey": self.TESTKEY, "name": "Brand", "action": "set", "type": W.REG_SZ, "value": "new"},
+        ]
+        f = {"id": "t", "title": "t", "fix": {"type": "reg_edit", "risk": "confirm", "items": items}}
+
+        def read(n):
+            try:
+                with W.OpenKey(W.HKEY_CURRENT_USER, self.TESTKEY) as k:
+                    return W.QueryValueEx(k, n)
+            except OSError:
+                return None
+        with tempfile.TemporaryDirectory() as td:
+            bdir = self._roundtrip([f], td)
+            self.assertEqual(read("ProxyEnable")[0], 0)
+            self.assertIsNone(read("ProxyServer"))
+            self.assertIsNone(read("Multi"))
+            self.assertEqual(read("Brand")[0], "new")
+            reg = open(os.path.join(bdir, "restore-all.reg"), encoding="utf-16").read()
+            self.assertIn('"ProxyEnable"=dword:00000001', reg)
+            self.assertIn('"Brand"=-', reg, "原来没有的值，.reg 里应写成删除")
+            self.assertIn("hex(7):", reg)
+            rr = bc.restore_backup(bdir)
+            self.assertTrue(all(r["ok"] for r in rr), rr)
+        self.assertEqual(read("ProxyEnable"), (1, W.REG_DWORD))
+        self.assertEqual(read("ProxyServer"), ("127.0.0.1:7890", W.REG_SZ))
+        self.assertEqual(read("Multi"), (["a", "b"], W.REG_MULTI_SZ))
+        self.assertEqual(read("Bin"), (b"\x01\x02\xff", W.REG_BINARY))
+        self.assertIsNone(read("Brand"), "还原后应删掉新建的值")
+
+    def test_hosts_clean_backup_apply_restore(self):
+        import stat
+        orig = ("# 注释\r\n127.0.0.1 localhost\r\n127.0.0.1 update.microsoft.com  # x\r\n"
+                "45.33.32.156 www.icbc.com.cn\r\n10.0.0.1 nas\r\n").encode("utf-8")
+        with tempfile.TemporaryDirectory() as td:
+            hp = os.path.join(td, "hosts")
+            with open(hp, "wb") as fp:
+                fp.write(orig)
+            os.chmod(hp, stat.S_IREAD)                     # 常见：hosts 被设成只读
+            rows = bc.analyze_hosts(orig.decode("utf-8"))
+            lines = [r["norm"] for r in rows if r["verdict"] in ("block_security", "redirect_bank")]
+            self.assertEqual(len(lines), 2)
+            f = {"id": "h", "title": "h", "fix": {"type": "hosts_clean", "risk": "confirm",
+                                                  "items": [{"path": hp, "lines": lines}]}}
+            bdir = self._roundtrip([f], os.path.join(td, "bak"))
+            with open(hp, "rb") as fp:
+                now = fp.read()
+            self.assertEqual(now, b"# \xe6\xb3\xa8\xe9\x87\x8a\r\n127.0.0.1 localhost\r\n10.0.0.1 nas\r\n",
+                             "只该删掉被标记的行，注释 / 其他行 / CRLF 原样保留")
+            self.assertFalse(os.access(hp, os.W_OK), "只读属性应该还原回去")
+            rr = bc.restore_backup(bdir)
+            self.assertTrue(all(r["ok"] for r in rr), rr)
+            with open(hp, "rb") as fp:
+                self.assertEqual(fp.read(), orig, "还原后应与原文件逐字节一致")
+            os.chmod(hp, stat.S_IWRITE)
+
+    def test_hosts_clean_gbk_encoding_kept(self):
+        orig = "# 中文注释\n127.0.0.1 www.360.cn\n10.0.0.1 nas\n".encode("gbk")
+        with tempfile.TemporaryDirectory() as td:
+            hp = os.path.join(td, "hosts")
+            with open(hp, "wb") as fp:
+                fp.write(orig)
+            ok, msg = bc._clean_hosts_file(hp, ["127.0.0.1 www.360.cn"])
+            self.assertTrue(ok, msg)
+            with open(hp, "rb") as fp:
+                self.assertEqual(fp.read(), "# 中文注释\n10.0.0.1 nas\n".encode("gbk"))
+
+    def test_lnk_args_backup_apply_restore(self):
+        with tempfile.TemporaryDirectory() as td:
+            lnk = os.path.join(td, "Google Chrome.lnk")
+            _make_lnk(lnk, sys.executable, "https://www.hao123.com/ --profile-directory=Default")
+            f = {"id": "l", "title": "l", "fix": {"type": "lnk_args", "risk": "confirm", "items": [
+                {"path": lnk, "args": "https://www.hao123.com/ --profile-directory=Default",
+                 "new_args": "--profile-directory=Default"}]}}
+            bdir = self._roundtrip([f], os.path.join(td, "bak"))
+            self.assertEqual(bc.parse_lnk(lnk)["args"], "--profile-directory=Default")
+            self.assertEqual(os.path.normcase(bc.parse_lnk(lnk)["target"]), os.path.normcase(sys.executable))
+            rr = bc.restore_backup(bdir)
+            self.assertTrue(all(r["ok"] for r in rr), rr)
+            self.assertEqual(bc.parse_lnk(lnk)["args"], "https://www.hao123.com/ --profile-directory=Default")
+
+    # ---------------- 接进体检 / 界面 ----------------
+    def test_analyze_and_gui_integration(self):
+        from PyQt5.QtWidgets import QApplication
+        import boot_doctor as bd
+        app = QApplication.instance() or QApplication([])  # noqa: F841
+        raw = fake_raw()
+        raw["hijack"] = {"managed": False, "proxy": {"enable": 1, "server": "127.0.0.1:7890"},
+                         "listeners": [], "policies": [], "ie": [], "lnks": [],
+                         "hosts": {"path": r"C:\x\hosts", "database_path": "",
+                                   "text": "127.0.0.1 www.360.cn\n"}}
+        res = bc.analyze(raw)
+        hij = [f for f in res["findings"] if f["cat"] == "浏览器劫持"]
+        self.assertEqual({f["id"] for f in hij}, {"hij_proxy_dead", "hij_hosts_block"})
+        for f in hij:
+            self.assertIn(f["fix"]["type"], bc.FIX_DESC)
+            self.assertFalse(f["default"], "劫持类处理默认不勾选，由用户决定")
+        self.assertLess(res["score"], bc.analyze(fake_raw())["score"], "有问题要扣分")
+        win = bd.MainWindow(autoscan=False)
+        try:
+            win.on_scan_done(raw, res)
+            cats = [win.tree.topLevelItem(i).text(0) for i in range(win.tree.topLevelItemCount())]
+            self.assertTrue(any("浏览器劫持" in c for c in cats), cats)
+        finally:
+            win.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
