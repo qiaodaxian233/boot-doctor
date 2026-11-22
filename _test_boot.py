@@ -2446,6 +2446,10 @@ class TestGuardE2E(unittest.TestCase):
 
     def test_a_guard_is_running_with_hook(self):
         self.assertTrue(bc.guard_running())
+        import time as _t
+        end = _t.time() + 12                                   # 自启监控是延后几百毫秒才启动的
+        while _t.time() < end and "自启监控已启动" not in self.log():
+            _t.sleep(0.2)
         log = self.log()
         self.assertIn("事件钩子=on", log, "事件钩子没装上，守护退回了纯轮询：\n" + log)
         self.assertIn("自启监控已启动", log, "自启监控没起来：\n" + log)

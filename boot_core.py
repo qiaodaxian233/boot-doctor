@@ -2044,7 +2044,7 @@ def start_popup_guard(progress=None):
     except Exception as e:
         log_line("start popup guard failed: %r" % (e,))
         return False, "启动失败：%s" % e
-    for _ in range(30):                      # 最多等 3 秒写 pid
+    for _ in range(80):                      # 最多等 8 秒写 pid（冷启动时 Python + Qt 导入就要 1~2 秒）
         time.sleep(0.1)
         if guard_running():
             log_line("popup guard started pid=%d" % guard_pid())
