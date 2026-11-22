@@ -2702,5 +2702,269 @@ class TestGuardE2E(unittest.TestCase):
         self.assertFalse(os.path.exists(bc.GUARD_PID_PATH), "pid 文件没清理")
 
 
+class TestSecurityStatus(unittest.TestCase):
+    """Windows 自带防护 / 杀软状态 + 一键开启 Defender 的「潜在有害应用拦截」。"""
+
+    @staticmethod
+    def _run(sysd):
+        got = []
+        bc._security_findings(sysd, lambda **kw: got.append(kw))
+        return {g["id"]: g for g in got}
+
+    def test_collect_real_machine(self):
+        d = bc.sys_info_native()
+        self.assertIsInstance(d.get("security"), dict)
+        sec = d["security"]
+        print("  安全防护原始数据：%r" % (sec,))
+        if sec.get("defender"):
+            de = sec["defender"]
+            for k in ("av", "rtp", "tamper"):
+                self.assertIsInstance(de.get(k), bool, k)
+            self.assertIsInstance(de.get("sigAge"), int)
+        if "pua" in sec:
+            self.assertIn(sec["pua"], (0, 1, 2))
+        self.assertIsInstance(d["disks"], list)          # 磁盘结果没被这次改动弄坏
+
+    def test_findings_logic(self):
+        base = {"osName": "Microsoft Windows 11 专业版"}
+        on = {"defender": {"av": True, "rtp": True, "sigAge": 0}, "av3": []}
+        self.assertEqual(set(self._run(dict(base, security=dict(on, pua=0)))), {"sec_pua"})
+        self.assertEqual(set(self._run(dict(base, security=dict(on, pua=1)))), set(), "已开启就不该报")
+        r = self._run(dict(base, security=dict(on, pua=2)))
+        self.assertEqual(set(r), {"sec_pua_audit"})
+        old = dict(on, pua=1)
+        old["defender"] = dict(on["defender"], sigAge=12, sigTime="2026-11-01 08:00")
+        self.assertEqual(set(self._run(dict(base, security=old))), {"sec_sig_old"})
+        # 装了第三方杀软：Defender 退居被动，不该再劝人开 PUA
+        third = {"defender": {"av": False, "rtp": False}, "pua": 0,
+                 "av3": [{"name": "Huorong", "state": 266240}, {"name": "Windows Defender", "state": 393216}]}
+        self.assertEqual(set(self._run(dict(base, security=third))), {"sec_av3"})
+        none = self._run(dict(base, security={"defender": {"av": False, "rtp": False}, "av3": []}))
+        self.assertEqual(none["sec_no_av"]["sev"], "high")
+        srv = self._run({"osName": "Microsoft Windows Server 2022", "security": {"defender": {"av": False, "rtp": False}}})
+        self.assertEqual(srv["sec_no_av"]["sev"], "info", "服务器没杀软不该报高危")
+        self.assertEqual(self._run(dict(base, security={})), {})
+        self.assertEqual(self._run(base), {})
+
+    def test_productstate_decode(self):
+        self.assertTrue(bc._sp_enabled(266240))      # 0x041000 开启
+        self.assertTrue(bc._sp_enabled(397312))      # 0x061000 开启
+        self.assertFalse(bc._sp_enabled(262144))     # 0x040000 关闭
+        self.assertFalse(bc._sp_enabled(393216))     # 0x060000 关闭
+        self.assertFalse(bc._sp_enabled(None))
+
+    def test_pua_backup_apply_restore_real_defender(self):
+        old = bc._read_pua()
+        if old is None:
+            self.skipTest("这台机器上读不到 Defender 的 PUA 设置")
+        f = {"id": "t", "title": "t", "fix": {"type": "defender_pua", "risk": "confirm",
+                                              "items": [{"value": 1 if old != 1 else 2}]}}
+        want = f["fix"]["items"][0]["value"]
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                bdir = bc.make_backup([f], backup_root=td, tag="ut")
+                snap = json.load(open(os.path.join(bdir, "snapshot.json"), encoding="utf-8"))
+                self.assertEqual(snap["items"][0]["old"], old, "备份里应记下原值")
+                res = bc.apply_fixes([f], bdir)
+                now = bc._read_pua()
+                if res[0]["ok"]:
+                    self.assertEqual(now, want)
+                    print("  PUA 设置：%s -> %s（已生效）" % (old, now))
+                    rr = bc.restore_backup(bdir)
+                    self.assertTrue(all(r["ok"] for r in rr), rr)
+                    self.assertEqual(bc._read_pua(), old, "还原后应回到原值")
+                else:
+                    # 被篡改保护 / 组策略锁住：必须如实失败，并告诉用户怎么手动改，且设置没被动
+                    print("  PUA 设置被锁住：%s" % res[0]["msgs"])
+                    self.assertIn("手动", " ".join(res[0]["msgs"]))
+                    self.assertEqual(now, old)
+        finally:
+            if bc._read_pua() != old:
+                bc._set_pua(old)
+
+    def test_analyze_and_gui_show_security_category(self):
+        from PyQt5.QtWidgets import QApplication
+        import boot_doctor as bd
+        app = QApplication.instance() or QApplication([])  # noqa: F841
+        raw = fake_raw()
+        raw["sys"]["security"] = {"defender": {"av": True, "rtp": True, "sigAge": 0}, "pua": 0, "av3": []}
+        res = bc.analyze(raw)
+        f = next((x for x in res["findings"] if x["id"] == "sec_pua"), None)
+        self.assertIsNotNone(f)
+        self.assertEqual(f["cat"], "安全防护")
+        self.assertFalse(f["default"])
+        self.assertEqual(f["fix"]["type"], "defender_pua")
+        self.assertIn("defender_pua", bc.FIX_DESC)
+        win = bd.MainWindow(autoscan=False)
+        try:
+            win.on_scan_done(raw, res)
+            cats = [win.tree.topLevelItem(i).text(0) for i in range(win.tree.topLevelItemCount())]
+            self.assertTrue(any("安全防护" in c for c in cats), cats)
+        finally:
+            win.close()
+
+
+class TestFileHashAndVirusTotal(unittest.TestCase):
+    def test_sha256_matches_hashlib_and_limit(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "x.bin")
+            blob = os.urandom(3 * 1024 * 1024 + 17)            # 不是 1MB 的整数倍，测分块边界
+            with open(p, "wb") as fp:
+                fp.write(blob)
+            self.assertEqual(bc.file_sha256(p), hashlib.sha256(blob).hexdigest())
+            with self.assertRaises(ValueError):
+                bc.file_sha256(p, max_mb=1)
+
+    def test_url_has_only_the_hash(self):
+        u = bc.virustotal_url("  ABCDEF0123  ")
+        self.assertEqual(u, "https://www.virustotal.com/gui/file/abcdef0123")
+
+    def test_gui_opens_url_without_uploading(self):
+        from PyQt5.QtWidgets import QApplication, QMessageBox
+        import hashlib
+        import boot_doctor as bd
+        app = QApplication.instance() or QApplication([])  # noqa: F841
+        opened, infos = [], []
+        old_open, old_info = bd.QDesktopServices.openUrl, QMessageBox.information
+        bd.QDesktopServices.openUrl = staticmethod(lambda u: opened.append(u.toString()) or True)
+        QMessageBox.information = staticmethod(lambda *a, **k: infos.append(a[2] if len(a) > 2 else ""))
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                p = os.path.join(td, "a.exe")
+                with open(p, "wb") as fp:
+                    fp.write(b"MZ-test-bytes")
+                sha = bd.open_virustotal(None, p)
+                self.assertEqual(sha, hashlib.sha256(b"MZ-test-bytes").hexdigest())
+                self.assertEqual(opened, ["https://www.virustotal.com/gui/file/" + sha])
+                self.assertEqual(bd.open_virustotal(None, os.path.join(td, "nope.exe")), "")
+                self.assertEqual(len(opened), 1, "文件不存在时不该打开网页")
+                self.assertTrue(infos, "文件不存在应当提示")
+                win = bd.MainWindow(autoscan=False)
+                try:
+                    win.on_copy_sha({"path": p})
+                    self.assertEqual(QApplication.clipboard().text(), sha)
+                    win.on_virustotal({"path": p})
+                    self.assertEqual(len(opened), 2)
+                finally:
+                    win.close()
+        finally:
+            bd.QDesktopServices.openUrl, QMessageBox.information = old_open, old_info
+
+
+class TestRunningProcessScan(unittest.TestCase):
+    """运行中的流氓软件进程：枚举 → 命中特征库 → 体检出条目 → 安全地结束。"""
+
+    def setUp(self):
+        import subprocess
+        self.child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
+                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        self.kids = [self.child]
+        self.old_check = bc.adware_check
+
+    def tearDown(self):
+        bc.adware_check = self.old_check
+        for k in self.kids:
+            try:
+                k.kill()
+            except Exception:
+                pass
+
+    def _find(self, procs, pid):
+        return next((p for p in procs if p["pid"] == pid), None)
+
+    def test_enum_sees_child_not_self_not_system(self):
+        import time as _t
+        _t.sleep(0.3)
+        procs = bc.enum_processes()
+        me = self._find(procs, self.child.pid)
+        self.assertIsNotNone(me, "枚举不到刚起的子进程")
+        self.assertEqual(os.path.normcase(me["path"]), os.path.normcase(sys.executable))
+        self.assertEqual(me["ctime"], bc._proc_create_time(self.child.pid))
+        self.assertGreater(me["ctime"], 0)
+        self.assertIsNone(self._find(procs, os.getpid()), "把自己也枚举进来了")
+        self.assertFalse([p for p in procs if bc._under_system_dir(p["path"])], "系统目录的进程不该在里面")
+        for k in ("pid", "ppid", "name", "path", "company", "ctime"):
+            self.assertIn(k, procs[0])
+
+    def test_collect_includes_procs(self):
+        raw = bc.collect()
+        self.assertIsInstance(raw["procs"], list)
+        self.assertTrue(raw["procs"], "一个进程都没枚举到")
+
+    def test_scan_merges_by_path_and_analyze_builds_kill_item(self):
+        import time as _t
+        _t.sleep(0.3)
+        p = self._find(bc.enum_processes(), self.child.pid)
+        twin = dict(p, pid=p["pid"] + 100000, ctime=p["ctime"] + 1)       # 同一个程序的第二个进程（虚构）
+        target = os.path.normcase(sys.executable)
+        bc.adware_check = lambda path="", name="", company="", cmd="": (
+            {"hit": True, "kind": "family", "family": "ludashi", "label": "鲁大师全家桶", "sev": "mid",
+             "why": "测试命中"} if os.path.normcase(path or "") == target else self.old_check(path, name, company, cmd))
+        raw = fake_raw()
+        raw["procs"] = [p, twin]
+        raw["adware"] = bc.adware_scan(raw)
+        hits = [h for h in raw["adware"]["items"] if h["kind"] == "process"]
+        self.assertEqual(len(hits), 1, "同一路径的两个进程应合并成一条")
+        self.assertEqual(sorted(x["pid"] for x in hits[0]["procs"]), sorted([p["pid"], twin["pid"]]))
+        res = bc.analyze(raw)
+        f = next((x for x in res["findings"] if x["id"].startswith("proc_kill@")), None)
+        self.assertIsNotNone(f, "没有生成「结束进程」条目")
+        self.assertEqual(f["cat"], "流氓软件")
+        self.assertFalse(f["default"], "结束进程默认不勾选")
+        self.assertEqual(f["fix"]["type"], "proc_kill")
+        self.assertEqual(len(f["fix"]["items"]), 2)
+        fam = next(x for x in res["findings"] if x["id"] == "adware_ludashi")
+        self.assertIn("正在运行", fam["detail"], "家族条目里应列出正在运行的进程")
+
+    def test_kill_full_flow_and_identity_checks(self):
+        import time as _t
+        _t.sleep(0.3)
+        p = self._find(bc.enum_processes(), self.child.pid)
+        item = {"pid": p["pid"], "ctime": p["ctime"], "path": p["path"], "name": os.path.basename(p["path"])}
+
+        # 1) 创建时间对不上（PID 被复用的情形）：不能动
+        ok, msg = bc.kill_process(item["pid"], item["ctime"] + 12345, item["path"])
+        self.assertTrue(ok)
+        self.assertIn("换了", msg)
+        self.assertIsNone(self.child.poll(), "身份对不上还是被结束了")
+        # 2) 路径对不上：不能动
+        ok, msg = bc.kill_process(item["pid"], item["ctime"], r"C:\somewhere\else.exe")
+        self.assertIsNone(self.child.poll())
+        # 3) 试运行：不动
+        ok, msg = bc.kill_process(item["pid"], item["ctime"], item["path"], dry_run=True)
+        self.assertTrue(ok and "试运行" in msg, msg)
+        self.assertIsNone(self.child.poll())
+        # 4) 走完整的 备份 → 执行 → 还原
+        f = {"id": "k", "title": "k", "fix": {"type": "proc_kill", "risk": "confirm", "items": [item]}}
+        with tempfile.TemporaryDirectory() as td:
+            bdir = bc.make_backup([f], backup_root=td, tag="ut")
+            res = bc.apply_fixes([f], bdir)
+            self.assertTrue(res[0]["ok"], res)
+            for _ in range(40):
+                if self.child.poll() is not None:
+                    break
+                _t.sleep(0.1)
+            self.assertIsNotNone(self.child.poll(), "进程没被结束")
+            self.assertIn("proc_kill", open(os.path.join(bdir, "说明.txt"), encoding="utf-8").read())
+            rr = bc.restore_backup(bdir)
+            self.assertTrue(all(r["ok"] for r in rr), rr)
+            self.assertIn("无法", " ".join(rr[0]["msgs"]))
+        # 5) 已经不在了：不算失败
+        ok, msg = bc.kill_process(item["pid"], item["ctime"], item["path"])
+        self.assertTrue(ok)
+
+    def test_never_kills_system_or_self(self):
+        self.assertFalse(bc.proc_kill_allowed("explorer.exe", r"C:\Users\x\explorer.exe"), "系统外壳进程名要拦")
+        self.assertFalse(bc.proc_kill_allowed("x.exe", os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "x.exe")))
+        self.assertFalse(bc.proc_kill_allowed("x.exe", r"D:\a\x.exe", pid=os.getpid()), "本程序自己")
+        self.assertFalse(bc.proc_kill_allowed("x.exe", r"D:\a\x.exe", pid=4))
+        self.assertFalse(bc.proc_kill_allowed("x.exe", ""))
+        self.assertTrue(bc.proc_kill_allowed("x.exe", r"D:\a\x.exe", pid=99999))
+        ok, msg = bc.kill_process(os.getpid(), 0, sys.executable)
+        self.assertFalse(ok)
+        self.assertIn("不允许", msg)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import datetime as _dt
+import hashlib
 import json
 import ntpath
 import os
@@ -50,7 +51,7 @@ SEV_CN = {"high": "高", "mid": "中", "low": "低", "info": "提示"}
 SEV_ORDER = {"high": 0, "mid": 1, "low": 2, "info": 3}
 SEV_WEIGHT = {"high": 15, "mid": 8, "low": 3, "info": 0}
 
-CAT_ORDER = ["启动速度", "快速启动", "流氓软件", "浏览器劫持", "开机自启", "延迟启动",
+CAT_ORDER = ["启动速度", "快速启动", "流氓软件", "浏览器劫持", "安全防护", "开机自启", "延迟启动",
              "服务与残留", "开机报错", "磁盘与其他"]
 
 HKLM = winreg.HKEY_LOCAL_MACHINE
@@ -70,6 +71,8 @@ FIX_DESC = {
     "startup_delete": "彻底删除自启项（删注册表值 / 启动文件夹快捷方式，原值或文件已备份）",
     "task_off": "禁用开机/登录触发的计划任务",
     "reg_edit": "修改浏览器 / 网络相关的注册表设置（原值已备份，可还原）",
+    "defender_pua": "开启 Windows Defender 的「潜在有害应用拦截」（拦截下载器 / 捆绑推广软件，原设置已备份）",
+    "proc_kill": "结束正在运行的流氓软件进程（只结束当前进程，无法还原；要根治请同时处理它的自启项 / 卸载）",
     "hosts_clean": "从 hosts 文件里删掉被劫持的行（整个文件已备份，可还原）",
     "lnk_args": "清掉浏览器快捷方式里被追加的网址（原快捷方式已备份，可还原）",
     "svc_delay": "服务改为『自动（延迟启动）』（仍会启动，只错开开机高峰）",
@@ -1307,7 +1310,7 @@ def adware_scan(raw):
     except Exception as e:
         log_line("bulk lnk resolve failed: %r" % (e,))
 
-    def consider(name, source, path, company, cmd, kind):
+    def consider(name, source, path, company, cmd, kind, extra=None):
         key = (name.lower(), (path or cmd or "").lower())
         if key in seen:
             return
@@ -1315,13 +1318,16 @@ def adware_scan(raw):
         if not r.get("hit"):
             return
         seen.add(key)
-        hits.append({
+        hit = {
             "name": name, "source": source, "path": path or cmd or "",
             "company": company or "", "kind": kind,
             "label": r.get("label", ""), "family": r.get("family", ""),
             "sev": r.get("sev", "mid"), "why": r.get("why", ""),
             "uninstall": "",
-        })
+        }
+        if extra:
+            hit.update(extra)
+        hits.append(hit)
 
     # 启动项
     for it in raw.get("startup") or []:
@@ -1348,6 +1354,18 @@ def adware_scan(raw):
         img = s.get("image") or s.get("path") or ""
         consider(s.get("name") or s.get("disp") or "", "服务",
                  img, s.get("company") or "", img, "service")
+
+    # 正在运行的进程：没有自启项、只在后台常驻的推广程序，上面三类都扫不到。
+    # 同一个程序常有好几个进程，按路径合并成一条，pid 列表留给「结束进程」用
+    by_path = {}
+    for pr in raw.get("procs") or []:
+        if pr.get("path"):
+            by_path.setdefault(pr["path"].lower(), []).append(pr)
+    for prs in by_path.values():
+        first = prs[0]
+        consider(first.get("name") or os.path.basename(first["path"]), "运行中", first["path"],
+                 first.get("company") or "", first["path"], "process",
+                 extra={"procs": [{"pid": x.get("pid"), "ctime": x.get("ctime") or 0} for x in prs]})
 
     # 已安装程序：很多全家桶本体不自启，但会常驻托盘 + 互相拉起，
     # 只看启动项会漏掉。这里单独扫一遍卸载表。
@@ -3164,6 +3182,75 @@ def _lnk_findings(d, add):
             fix=fix, default=False)
 
 
+def _sp_enabled(state):
+    """SecurityCenter 的 productState：第 12~15 位是「实时防护状态」，1 = 开启。"""
+    try:
+        return ((int(state) >> 12) & 0xF) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _security_findings(sysd, add):
+    """Windows 自带防护 / 杀软状态：有没有杀软在保护、病毒库新不新、PUA 拦截开没开。
+
+    PUA（潜在有害应用拦截）是 Windows Defender 自带的功能，专门拦下载器 / 捆绑推广软件，
+    特征库由微软持续更新——比我们自己维护名单强得多，但很多机器默认没开。
+    装了别的杀软时 Defender 会自动退居被动，PUA 设置不适用，只提示由谁在保护。
+    """
+    sec = (sysd or {}).get("security") or {}
+    if not sec:
+        return
+    de = sec.get("defender") or {}
+    av3 = [x for x in (sec.get("av3") or []) if x.get("name")]
+    third = [x for x in av3 if "defender" not in x["name"].lower() and _sp_enabled(x.get("state"))]
+    def_active = bool(de.get("av") and de.get("rtp"))
+    is_server = "server" in ((sysd or {}).get("osName") or "").lower()
+
+    if not def_active and not third and not any(_sp_enabled(x.get("state")) for x in av3):
+        why = ("Windows Defender 的实时保护是关着的" if de else "没有检测到任何杀毒软件")
+        add(id="sec_no_av", cat="安全防护", sev="info" if is_server else "high",
+            title="没有杀毒软件在实时保护这台电脑",
+            short=why,
+            detail=("%s，也没有别的杀毒软件在运行。\n\n这台电脑现在没有实时防护：下载器、捆绑推广软件、"
+                    "挖矿程序运行时没人拦。\n\n处理：打开「Windows 安全中心 → 病毒和威胁防护」，"
+                    "把「实时保护」打开；或者装一个杀毒软件（火绒等）。本工具不自动开启，"
+                    "因为这类开关常被篡改保护锁住，需要你在系统里确认。") % why)
+    elif third:
+        names = "、".join(x["name"] for x in third[:3])
+        add(id="sec_av3", cat="安全防护", sev="info", title="实时防护由 %s 负责" % names,
+            short="Defender 已自动退居被动",
+            detail=("检测到 %s 正在运行。装了第三方杀软时 Windows Defender 会自动退居被动，"
+                    "它的「潜在有害应用拦截」不再起作用——拦截下载器和捆绑软件由 %s 的设置负责，"
+                    "请在它的设置里确认「软件净化 / 弹窗拦截 / 恶意下载拦截」之类的功能是开着的。") % (names, names))
+    if def_active and not third:
+        pua = sec.get("pua")
+        if pua == 0:
+            add(id="sec_pua", cat="安全防护", sev="low",
+                title="Defender 的「潜在有害应用拦截」没开",
+                short="开了就能拦下载器 / 捆绑推广软件",
+                impact="下载 / 安装时拦截推广类软件",
+                detail=("「潜在有害应用」（PUA）指那些不算病毒、但会捆绑推广、弹广告、悄悄装别的软件的下载器和"
+                        "广告程序。Windows Defender 自带对它们的拦截，特征库由微软持续更新，但很多机器默认没开。\n\n"
+                        "开启后：下载 / 运行这类程序时 Defender 会拦下并提示，不影响正常软件。\n"
+                        "处理：开启（原设置已备份，可还原）。如果被「篡改保护」锁住，会提示你到"
+                        "「Windows 安全中心 → 应用和浏览器控制 → 基于声誉的保护」里手动打开。"),
+                fix={"type": "defender_pua", "risk": "confirm", "items": [{"value": 1}]}, default=False)
+        elif pua == 2:
+            add(id="sec_pua_audit", cat="安全防护", sev="info",
+                title="Defender 的「潜在有害应用拦截」是审核模式",
+                short="只记录、不拦截",
+                detail="审核模式只在日志里记一笔，不会真的拦下。需要拦截的话在「Windows 安全中心 → 应用和浏览器控制 → "
+                       "基于声誉的保护」里改成「阻止应用」。")
+        age = de.get("sigAge")
+        if isinstance(age, int) and 0 <= age < 100000 and age >= 7:
+            add(id="sec_sig_old", cat="安全防护", sev="mid",
+                title="Defender 病毒库已经 %d 天没更新" % age,
+                short="最近一次更新：%s" % (de.get("sigTime") or "未知"),
+                detail=("病毒库太旧，新出现的下载器和推广程序它认不出来。\n\n处理：打开「Windows 安全中心 → 病毒和威胁防护 → "
+                        "病毒和威胁防护更新 → 检查更新」。如果一直更新失败，常见原因是 Windows Update 服务被关、"
+                        "或网络里屏蔽了微软的更新域名（体检的「浏览器劫持」会检查 hosts）。"))
+
+
 def _hijack_findings(d, add):
     if not d:
         return
@@ -3172,6 +3259,121 @@ def _hijack_findings(d, add):
             fn(d, add)
         except Exception as e:
             log_line("hijack finding %s failed: %r" % (fn.__name__, e))
+
+
+# --------------------------------------------------------------------------
+# 文件哈希 + VirusTotal 查询入口
+#
+# 只把 SHA-256 拼进网址、由用户在浏览器里打开：不上传文件，也不需要 API 密钥。
+# 哈希是单向的，网站只能看到「有人问了这个哈希」，看不到文件内容和你的电脑信息。
+# --------------------------------------------------------------------------
+def file_sha256(path, max_mb=500):
+    """流式算 SHA-256（1MB 一块，不会把大文件读进内存）。超过 max_mb 抛 ValueError。"""
+    size = os.path.getsize(path)
+    if size > max_mb * 1024 * 1024:
+        raise ValueError("文件太大（%.0f MB，上限 %d MB）" % (size / 1048576.0, max_mb))
+    h = hashlib.sha256()
+    with open(path, "rb") as fp:
+        for blk in iter(lambda: fp.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def virustotal_url(sha256):
+    return "https://www.virustotal.com/gui/file/" + (sha256 or "").strip().lower()
+
+
+# --------------------------------------------------------------------------
+# 运行中的进程扫描：没有自启项、只在后台常驻的推广程序，只扫自启项 / 服务 / 已安装程序会漏掉
+#
+# 只取不在系统目录下、能读到路径的进程（系统目录的由系统文件保护管，也避免误伤）。
+# 识别复用 adware_check（特征库 + 签名核实），这里只负责「枚举」和「安全地结束」。
+# --------------------------------------------------------------------------
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong),
+                ("th32ProcessID", ctypes.c_ulong), ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", ctypes.c_ulong), ("cntThreads", ctypes.c_ulong),
+                ("th32ParentProcessID", ctypes.c_ulong), ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", ctypes.c_ulong), ("szExeFile", ctypes.c_wchar * 260)]
+
+
+def _under_system_dir(path):
+    win = os.environ.get("SystemRoot", r"C:\Windows").lower().rstrip("\\") + "\\"
+    return (path or "").lower().replace("/", "\\").startswith(win)
+
+
+def enum_processes():
+    """正在运行、且不在系统目录下的进程：[{pid, ppid, name, path, company, ctime}]。"""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    k32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_ulong, ctypes.c_ulong]
+    k32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+    k32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)                  # TH32CS_SNAPPROCESS
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        raise OSError(ctypes.get_last_error(), "CreateToolhelp32Snapshot failed")
+    out, me = [], os.getpid()
+    try:
+        pe = _PROCESSENTRY32W()
+        pe.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        ok = k32.Process32FirstW(snap, ctypes.byref(pe))
+        while ok:
+            pid = int(pe.th32ProcessID)
+            if pid > 4 and pid != me:
+                path = _proc_image_path(pid)
+                if path and not _under_system_dir(path):
+                    out.append({"pid": pid, "ppid": int(pe.th32ParentProcessID),
+                                "name": pe.szExeFile or os.path.basename(path), "path": path,
+                                "company": _ver_company(path), "ctime": _proc_create_time(pid)})
+            ok = k32.Process32NextW(snap, ctypes.byref(pe))
+    finally:
+        k32.CloseHandle(snap)
+    return out
+
+
+def proc_kill_allowed(name, path, pid=0):
+    """这个进程允许被本工具结束吗？系统目录 / 系统外壳进程 / 本程序自己，一律不碰。"""
+    if pid and (pid <= 4 or pid == os.getpid()):
+        return False
+    if (name or "").lower() in _POPUP_SAFE_PROCS or _under_system_dir(path):
+        return False
+    return bool(path)
+
+
+def kill_process(pid, ctime, path, dry_run=False):
+    """结束一个进程，返回 (ok, 说明)。
+
+    PID 会被复用，所以结束前先核对「创建时间 + 映像路径」和采集时一致，不一致说明已经不是
+    当时那个进程了，宁可不动。
+    """
+    name = os.path.basename(path or "") or str(pid)
+    if not proc_kill_allowed(name, path, pid):
+        return False, "不允许结束：%s（系统进程 / 本程序自己）" % name
+    if not _pid_alive(pid):
+        return True, "已经不在运行：%s" % name
+    if ctime and _proc_create_time(pid) != ctime:
+        return True, "进程已经换了（PID 被复用），跳过：%s" % name
+    if (_proc_image_path(pid) or "").lower() != (path or "").lower():
+        return True, "进程的程序路径对不上，跳过：%s" % name
+    if dry_run:
+        return True, "[试运行] 结束进程 %s（PID %d）" % (name, pid)
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    k32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    h = k32.OpenProcess(0x0001 | 0x00100000, False, pid)        # TERMINATE | SYNCHRONIZE
+    if not h:
+        return False, "没有权限结束 %s（PID %d）：错误码 %d" % (name, pid, ctypes.get_last_error())
+    try:
+        if not k32.TerminateProcess(h, 1):
+            return False, "结束 %s 失败：错误码 %d" % (name, ctypes.get_last_error())
+        k32.WaitForSingleObject(h, 3000)
+    finally:
+        k32.CloseHandle(h)
+    return True, "已结束进程：%s（PID %d）" % (name, pid)
 
 
 # --------------------------------------------------------------------------
@@ -3368,7 +3570,20 @@ Get-CimInstance -Namespace root/Microsoft/Windows/Storage -ClassName MSFT_Physic
   $hs = $h[[int]$_.HealthStatus]; if(-not $hs){ $hs = [string]$_.HealthStatus }
   $r += @{ name = [string]$_.FriendlyName; media = $mt; size = [int]([math]::Round($_.Size / 1GB)); health = $hs }
 }
-ConvertTo-Json -InputObject @($r) -Depth 4 -Compress
+$sec = @{}
+try {
+  $s = Get-CimInstance -Namespace root/Microsoft/Windows/Defender -ClassName MSFT_MpComputerStatus -ErrorAction Stop
+  $sig = ''; if($s.AntivirusSignatureLastUpdated){ $sig = $s.AntivirusSignatureLastUpdated.ToString('yyyy-MM-dd HH:mm') }
+  $sec.defender = @{ am = [bool]$s.AMServiceEnabled; av = [bool]$s.AntivirusEnabled; rtp = [bool]$s.RealTimeProtectionEnabled; tamper = [bool]$s.IsTamperProtected; sigAge = [int]$s.AntivirusSignatureAge; sigTime = $sig }
+} catch {}
+try {
+  $p = Get-CimInstance -Namespace root/Microsoft/Windows/Defender -ClassName MSFT_MpPreference -ErrorAction Stop
+  $sec.pua = [int]$p.PUAProtection
+} catch {}
+try {
+  $sec.av3 = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop | ForEach-Object { @{ name = [string]$_.displayName; state = [int]$_.productState } })
+} catch {}
+ConvertTo-Json -InputObject @{ disks = @($r); security = $sec } -Depth 6 -Compress
 """
 
 PS_TASKS = r"""
@@ -3566,8 +3781,13 @@ def sys_info_native(with_disks=True):
         "tasks": [],
     }
     if with_disks:
-        disks = _parse_json(run_ps(PS_DISKS, timeout=60))
-        d["disks"] = disks if isinstance(disks, list) else []
+        obj = _parse_json(run_ps(PS_DISKS, timeout=60))
+        if isinstance(obj, dict):                      # 磁盘 + 安全防护状态（同一个 PowerShell 进程）
+            disks = obj.get("disks")
+            d["disks"] = disks if isinstance(disks, list) else ([disks] if isinstance(disks, dict) else [])
+            d["security"] = obj.get("security") or {}
+        else:                                          # 兼容旧格式（纯磁盘数组）
+            d["disks"] = obj if isinstance(obj, list) else []
     try:
         d["tasks"] = boot_logon_tasks_from_xml()
     except OSError:
@@ -3649,6 +3869,7 @@ def collect(progress=None, should_stop=None):
     # 主线程同时做便宜的注册表读取
     wait_sys = _bg_call(collect_sys)
     wait_evt = _bg_call(lambda: _parse_json(run_ps(PS_EVENTS, timeout=180)))
+    wait_procs = _bg_call(enum_processes)
 
     P("读取注册表：开机自启项 …")
     raw["startup"] = enum_startup_items()
@@ -3666,6 +3887,9 @@ def collect(progress=None, should_stop=None):
         raw["extra"] = []
     P("检查浏览器劫持（代理 / 策略 / hosts / 快捷方式）…")
     raw["hijack"] = collect_hijack()
+    P("扫描正在运行的进程 …")
+    procs = wait_procs()
+    raw["procs"] = procs if isinstance(procs, list) else []
     P("比对流氓软件 / 全家桶特征库 …")
     try:
         raw["adware"] = adware_scan(raw)
@@ -5302,7 +5526,8 @@ def analyze(raw):
             names = [g.get("name") or "" for g in group]
             names = [n for n in names if n]
             inst = [g for g in group if g.get("kind") == "installed"]
-            starts = [g for g in group if g.get("kind") != "installed"]
+            running = [g for g in group if g.get("kind") == "process"]
+            starts = [g for g in group if g.get("kind") not in ("installed", "process")]
             why = group[0].get("why") or ""
 
             lines = ["命中特征库：%s" % why, ""]
@@ -5317,6 +5542,11 @@ def analyze(raw):
                 lines.append("随开机启动：")
                 for g in starts[:12]:
                     lines.append("  · [%s] %s" % (g.get("source") or "", g.get("name") or ""))
+            if running:
+                lines.append("")
+                lines.append("正在运行：")
+                for g in running[:10]:
+                    lines.append("  · %s（%d 个进程）" % (g.get("name") or "", len(g.get("procs") or [1])))
             lines.append("")
             lines.append("建议：这类软件通常是「装一个带一串」，卸载本体后残留的启动项与"
                          "服务仍会随开机加载。建议先在「设置 → 应用」里正常卸载，"
@@ -5346,6 +5576,36 @@ def analyze(raw):
                 uninstall_cmd=uninst,
                 adware_group=[g.get("name") for g in group if g.get("name")],
                 opts=opts or None)
+
+    # 正在运行的流氓软件进程：给一个能直接处理的条目（按家族 / 标签合并）
+    proc_groups = {}
+    for g in aw_items:
+        if g.get("kind") == "process":
+            proc_groups.setdefault(g.get("family") or ("~" + (g.get("label") or g.get("name") or "")), []).append(g)
+    for gk, group in proc_groups.items():
+        items = []
+        for g in group:
+            for pr in g.get("procs") or []:
+                nm = os.path.basename(g.get("path") or "")
+                if pr.get("pid") and proc_kill_allowed(nm, g.get("path") or "", int(pr["pid"])):
+                    items.append({"pid": int(pr["pid"]), "ctime": int(pr.get("ctime") or 0),
+                                  "path": g.get("path") or "", "name": nm})
+        label = group[0].get("label") or gk
+        names = sorted({os.path.basename(g.get("path") or "") for g in group})
+        n_proc = sum(len(g.get("procs") or [1]) for g in group)
+        sev = "high" if any(g.get("sev") == "high" for g in group) else "mid"
+        add(id="proc_kill@" + gk, cat="流氓软件", sev=sev, name=label, src="运行中",
+            title="正在运行的%s进程：%d 个" % (label, n_proc),
+            short="、".join(names[:3]) + ("…" if len(names) > 3 else ""),
+            impact="结束进程（不可还原）",
+            detail=("命中特征库：%s\n\n正在运行：\n%s\n\n"
+                    "「结束进程」只结束当前这些进程，**无法还原**（要用的话重新运行对应程序即可）。\n"
+                    "如果它有自启项或服务，下次开机 / 登录还会再起来——要根治，请同时「禁止启动」"
+                    "它的自启项，或者直接卸载。") % (
+                        group[0].get("why") or "", "\n".join("  · %s" % (g.get("path") or "") for g in group[:10])),
+            app=describe_app(group[0].get("path") or "") or None,
+            fix={"type": "proc_kill", "risk": "confirm", "items": items} if items else None,
+            default=False)
 
     # 隐蔽启动点：单独列，即使没命中流氓特征也值得看
     extra = raw.get("extra") or []
@@ -5813,6 +6073,12 @@ def analyze(raw):
     # ---------------- 浏览器劫持 ----------------
     _hijack_findings(raw.get("hijack"), add)
 
+    # ---------------- 安全防护（杀软 / Defender / PUA） ----------------
+    try:
+        _security_findings(sysd, add)
+    except Exception as e:
+        log_line("security findings failed: %r" % (e,))
+
     add(id="bios_tip", cat="磁盘与其他", sev="info",
         title="BIOS / 固件层优化建议（可选）",
         short="系统内无法自动处理",
@@ -6068,6 +6334,13 @@ def make_backup(findings, backup_root=None, tag=""):
                 snap["items"].append({"id": rid, "kind": "reg_edit", "hive": hv,
                                       "subkey": it["subkey"], "name": it["name"],
                                       "existed": val is not None, "value": val, "valuetype": typ})
+        elif t == "defender_pua":
+            snap["items"].append({"id": rid, "kind": "defender_pua", "name": "PUAProtection",
+                                  "old": _read_pua()})
+        elif t == "proc_kill":
+            for it in fx["items"]:
+                snap["items"].append({"id": rid, "kind": "proc_kill", "name": it.get("name", ""),
+                                      "path": it.get("path", ""), "pid": it.get("pid")})
         elif t == "hosts_clean":
             for it in fx["items"]:
                 rec = {"id": rid, "kind": "hosts", "name": "hosts", "path": it["path"]}
@@ -6161,6 +6434,11 @@ def make_backup_readme_text(snap):
     if need:
         out.append("以下内容 .reg 文件管不到，必须用第 1 种方式（软件内还原）：")
         out += ["  · %s" % x for x in dict.fromkeys(need)]
+    if "proc_kill" in kinds:
+        out.append("本次还结束过运行中的进程：进程无法『还原』，需要的话重新运行对应程序即可。")
+    if "defender_pua" in kinds:
+        out.append("本次还改过 Windows Defender 的「潜在有害应用拦截」：可在软件内还原，"
+                   "也可到 Windows 安全中心手动改回。")
     out.append("")
     out.append("还原前建议先关闭正在运行的相关软件，还原后重启生效。")
     return "\n".join(out) + "\n"
@@ -6350,6 +6628,34 @@ def _set_lnk_args(path, new_args, dry_run=False):
     if (info.get("args") or "") != (new_args or ""):
         return False, "改写后校验不一致：%s（参数现为 %r）" % (path, info.get("args"))
     return True, "已清掉快捷方式里多余的网址：%s" % path
+
+
+def _read_pua():
+    """当前 Defender 的 PUAProtection（0 关 / 1 开 / 2 审核）；读不到返回 None。"""
+    out = run_ps("(Get-CimInstance -Namespace root/Microsoft/Windows/Defender "
+                 "-ClassName MSFT_MpPreference -ErrorAction SilentlyContinue).PUAProtection", timeout=60)
+    try:
+        return int((out or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _set_pua(value, dry_run=False):
+    """设置 Defender 的 PUAProtection 并回读校验。返回 (ok, 说明)。"""
+    value = int(value)
+    label = {0: "关闭", 1: "开启", 2: "审核模式"}.get(value, str(value))
+    if dry_run:
+        return True, "[试运行] 把「潜在有害应用拦截」设为：%s" % label
+    env = dict(os.environ)
+    env["BD_PUA"] = str(value)
+    out = run_ps("$ErrorActionPreference='Stop';try{Set-MpPreference -PUAProtection ([int]$env:BD_PUA);'OK'}"
+                 "catch{'ERR '+$_.Exception.Message}", timeout=60, env=env) or ""
+    now = _read_pua()
+    if now == value:
+        return True, "「潜在有害应用拦截」已设为：%s" % label
+    why = out.strip().splitlines()[-1][:160] if out.strip() else "没有返回信息"
+    return False, ("设置失败（当前值 %s）：%s。多半被「篡改保护」或组策略锁住了——请到「Windows 安全中心 → "
+                   "应用和浏览器控制 → 基于声誉的保护 → 潜在有害应用阻止」里手动设置。" % (now, why))
 
 
 def _set_service_start(name, val, dry_run=False):
@@ -6674,6 +6980,17 @@ def apply_fixes(findings, backup_dir, progress=None, dry_run=False):
                     ok, msg = _reg_edit_apply(it, dry_run)
                     res["msgs"].append(msg)
                     res["ok"] = res["ok"] and ok
+            elif t == "defender_pua":
+                for it in fx["items"]:
+                    ok, msg = _set_pua(it.get("value", 1), dry_run)
+                    res["msgs"].append(msg)
+                    res["ok"] = res["ok"] and ok
+            elif t == "proc_kill":
+                for it in fx["items"]:
+                    ok, msg = kill_process(int(it["pid"]), int(it.get("ctime") or 0),
+                                           it.get("path", ""), dry_run)
+                    res["msgs"].append(msg)
+                    res["ok"] = res["ok"] and ok
             elif t == "hosts_clean":
                 for it in fx["items"]:
                     ok, msg = _clean_hosts_file(it["path"], it.get("lines"), dry_run)
@@ -6852,6 +7169,15 @@ def restore_backup(backup_dir, progress=None, dry_run=False):
                 ok, msg = _reg_edit_restore(it, dry_run)
                 res["ok"] = ok
                 res["msgs"].append(msg)
+            elif k == "defender_pua":
+                if it.get("old") is None:
+                    res["msgs"].append("（快照里没有原值，请到 Windows 安全中心手动确认）")
+                else:
+                    ok, msg = _set_pua(it["old"], dry_run)
+                    res["ok"] = ok
+                    res["msgs"].append(msg)
+            elif k == "proc_kill":
+                res["msgs"].append("进程已被结束，无法『还原』；需要的话重新运行 %s 即可" % (it.get("path") or it.get("name")))
             elif k in ("hosts", "lnk_args"):
                 src = os.path.join(backup_dir, it.get("backup_file") or "")
                 dst = it.get("path") or ""

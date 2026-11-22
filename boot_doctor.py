@@ -19,9 +19,9 @@ import time
 import traceback
 
 from PyQt5.QtCore import (QEvent, QFileInfo, QObject, QRect, QSize, Qt, QThread, QTimer,
-                          pyqtSignal)
-from PyQt5.QtGui import (QBrush, QColor, QCursor, QFont, QIcon, QLinearGradient,
-                         QPainter, QPalette, QPen, QPixmap, QTextOption)
+                          QUrl, pyqtSignal)
+from PyQt5.QtGui import (QBrush, QColor, QCursor, QDesktopServices, QFont, QIcon,
+                         QLinearGradient, QPainter, QPalette, QPen, QPixmap, QTextOption)
 from PyQt5.QtWidgets import QProxyStyle, QStyleOptionViewItem
 from PyQt5.QtWidgets import (
     QAbstractItemView, QAction, QApplication, QButtonGroup, QCheckBox, QComboBox,
@@ -660,6 +660,33 @@ class DialogChrome(QObject):
         return False
 
 
+def hash_of_file(parent, path, what="文件"):
+    """算文件的 SHA-256（带等待光标，失败弹提示）。返回哈希，失败返回 ""。"""
+    if not path or not os.path.isfile(path):
+        QMessageBox.information(parent, what, "找不到这个文件（可能已被删除 / 改名）。")
+        return ""
+    QApplication.setOverrideCursor(Qt.WaitCursor)
+    try:
+        return bc.file_sha256(path)
+    except (OSError, ValueError) as e:
+        QMessageBox.warning(parent, what, "没法计算哈希：%s" % e)
+        return ""
+    finally:
+        QApplication.restoreOverrideCursor()
+
+
+def open_virustotal(parent, path):
+    """在浏览器里打开这个文件在 VirusTotal 上的报告页。
+
+    只把 SHA-256 拼进网址：不上传文件，不需要密钥；网站只能看到「有人问了这个哈希」。
+    返回打开的哈希（失败返回 ""）。
+    """
+    sha = hash_of_file(parent, path, "VirusTotal")
+    if sha:
+        QDesktopServices.openUrl(QUrl(bc.virustotal_url(sha)))
+    return sha
+
+
 def _excepthook(tp, val, tb):
     txt = "".join(traceback.format_exception(tp, val, tb))
     bc.log_line("UNCAUGHT:\n" + txt)
@@ -1048,6 +1075,11 @@ class PopupDialog(QDialog):
         self.btn_open = QPushButton("打开位置")
         self.btn_open.clicked.connect(self.on_open_path)
         bar.addWidget(self.btn_open)
+
+        self.btn_vt = QPushButton("查 VirusTotal")
+        self.btn_vt.setToolTip("在浏览器里打开这个程序的 VirusTotal 报告页。\n只发送文件的 SHA-256 哈希，不上传文件。")
+        self.btn_vt.clicked.connect(self.on_virustotal)
+        bar.addWidget(self.btn_vt)
 
         bar.addStretch(1)
         v.addLayout(bar)
@@ -1465,6 +1497,14 @@ class PopupDialog(QDialog):
             subprocess.Popen(["explorer", "/select,", it["path"]])
         except Exception:
             pass
+
+    @guard
+    def on_virustotal(self):
+        it = self._cur_item()
+        if it and it.get("path"):
+            sha = open_virustotal(self, it["path"])
+            if sha:
+                self.log.appendPlainText("已在浏览器打开 VirusTotal（只发送了哈希 %s…）：%s" % (sha[:12], it.get("proc") or ""))
 
     # ---------------- 守护 ----------------
     def _sync_guard(self):
@@ -3401,6 +3441,12 @@ class MainWindow(QMainWindow):
         a_sig = m.addAction("查看数字签名")
         a_sig.triggered.connect(lambda: self.show_signature(app))
         a_sig.setEnabled(bool(app.get("exists")))
+        a_vt = m.addAction("在 VirusTotal 查询这个文件…（只发送哈希）")
+        a_vt.triggered.connect(lambda: self.on_virustotal(app))
+        a_vt.setEnabled(bool(app.get("exists")))
+        a_sha = m.addAction("复制文件 SHA-256")
+        a_sha.triggered.connect(lambda: self.on_copy_sha(app))
+        a_sha.setEnabled(bool(app.get("exists")))
         a_copy = m.addAction("复制文件路径")
         a_copy.triggered.connect(lambda: self._copy_text(app.get("path") or "", "文件路径"))
         a_copy.setEnabled(bool(app.get("path")))
@@ -3528,6 +3574,20 @@ class MainWindow(QMainWindow):
             return
         QApplication.clipboard().setText(text)
         self.statusBar().showMessage("已复制%s" % what, 4000)
+
+    @guard
+    def on_virustotal(self, app):
+        sha = open_virustotal(self, (app or {}).get("path") or "")
+        if sha:
+            self.statusBar().showMessage(
+                "已在浏览器打开 VirusTotal（只发送了文件的哈希 %s…，没有上传文件）" % sha[:12], 8000)
+            self._log("VirusTotal 查询：%s  sha256=%s" % ((app or {}).get("path"), sha))
+
+    @guard
+    def on_copy_sha(self, app):
+        sha = hash_of_file(self, (app or {}).get("path") or "", "SHA-256")
+        if sha:
+            self._copy_text(sha, " SHA-256")
 
     # ---------------- 流氓软件：卸载 ----------------
     @guard
