@@ -22,7 +22,7 @@
 > 出厂策略：只勾选"安全级"项目；"需确认"的项目默认不勾，自己判断后再勾。
 > 排障时请用**重启**（快速启动只加速"关机→开机"）。
 
-## 待发布：体检再提速（采集 2.1s → 0.75s）+ 打开少等 1 秒
+## 待发布：体检再提速（采集 2.1s → 0.75s）+ 打开时少起一个 PowerShell
 
 CI（GitHub windows-latest）上逐条计时后，瓶颈在 `PS_SYS`：PowerShell 冷启动 + `Get-PhysicalDisk`
 （要先加载 Storage 模块，1.1s）+ `Get-ScheduledTask`（枚举全部任务的 CIM 对象，0.65s）。

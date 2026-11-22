@@ -3966,7 +3966,7 @@ def relaunch_elevated():
 
 def main():
     # 提权放在程序里做：启动体检.bat 不再先起一个 PowerShell 去 Start-Process -Verb RunAs，
-    # 打开快约 1 秒；用户拒绝 UAC 时以普通权限继续（界面上有「以管理员身份重启」）
+    # 少一个 PowerShell 冷启动；用户拒绝 UAC 时以普通权限继续（界面上有「以管理员身份重启」）
     if not bc.is_admin() and "--no-elevate" not in sys.argv \
             and not os.environ.get("BOOTDOC_NO_ELEVATE"):
         if relaunch_elevated()[0]:

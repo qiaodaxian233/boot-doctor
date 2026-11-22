@@ -1,7 +1,7 @@
 @echo off
 chcp 936 >nul
 cd /d "%~dp0"
-rem 提权交给程序自己（ShellExecute runas），这里不再先起一个 PowerShell，打开快约 1 秒
+rem 提权交给程序自己（ShellExecute runas），这里不再先起一个 PowerShell（冷启动常要 0.5~1 秒）
 set "PY="
 for %%P in ("%LOCALAPPDATA%\Programs\Python\Python310\pythonw.exe" "C:\Users\Administrator\AppData\Local\Programs\Python\Python310\pythonw.exe") do if not defined PY if exist %%P set "PY=%%~P"
 if not defined PY for %%P in (pythonw.exe) do set "PY=%%~$PATH:P"
