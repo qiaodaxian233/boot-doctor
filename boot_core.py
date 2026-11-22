@@ -1769,6 +1769,10 @@ def should_close_popup(win, rules=None):
     proc = (win.get("proc") or "").lower()
     if cls in _POPUP_SAFE_CLASSES:
         return False, "系统窗口"
+    # 系统进程也必须在用户规则之前判断：否则一条 title=「下载」的规则
+    # 会把资源管理器里打开的「下载」文件夹窗口（explorer.exe / CabinetWClass）关掉
+    if proc in _POPUP_SAFE_PROCS:
+        return False, "系统进程"
     if not rules.get("enabled"):
         return False, "拦截未开启"
     for r in rules.get("allow") or []:
@@ -1779,8 +1783,6 @@ def should_close_popup(win, rules=None):
             return True, "规则命中（%s）" % (r.get("note") or
                                           r.get("pattern") or "组合条件")
     if rules.get("auto_adware") and win.get("judge") == "adware":
-        if proc in _POPUP_SAFE_PROCS:
-            return False, "系统进程"
         return True, win.get("why") or "命中流氓软件特征库"
     return False, ""
 
@@ -1900,13 +1902,60 @@ def _pid_alive(pid):
                 pass
 
 
-def guard_pid():
+def _proc_create_time(pid):
+    """进程创建时间（FILETIME 的 64 位整数），失败返回 0。
+
+    PID 会被系统复用（重启后尤其常见），只有「PID + 创建时间」才能唯一认出一个进程。
+    """
+    h = None
     try:
-        with open(GUARD_PID_PATH, "r", encoding="utf-8") as fp:
-            pid = int((fp.read() or "0").strip() or 0)
+        h = _K.OpenProcess(0x1000, False, int(pid))     # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return 0
+        ft = [ctypes.wintypes.FILETIME() for _ in range(4)]
+        if not _K.GetProcessTimes(h, *[ctypes.byref(x) for x in ft]):
+            return 0
+        return (int(ft[0].dwHighDateTime) << 32) | int(ft[0].dwLowDateTime)
     except Exception:
         return 0
-    return pid if pid and _pid_alive(pid) else 0
+    finally:
+        if h:
+            try:
+                _K.CloseHandle(h)
+            except Exception:
+                pass
+
+
+def write_guard_pid(path=None):
+    """守护进程启动时调用：写「PID 创建时间」两个数，供 guard_pid() 校验身份。"""
+    p = path or GUARD_PID_PATH
+    pid = os.getpid()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as fp:
+        fp.write("%d %d" % (pid, _proc_create_time(pid)))
+
+
+def guard_pid(path=None):
+    """返回正在运行的守护 PID，没有则 0。
+
+    只看 PID 不够：守护被关机 / 注销直接结束时来不及删 pid 文件，下次开机这个 PID
+    可能已经分给了别的程序。那样界面会误报「守护已在运行」，stop_popup_guard()
+    更会对那个无关进程 TerminateProcess（本程序是管理员权限，几乎什么都杀得掉）。
+    """
+    try:
+        with open(path or GUARD_PID_PATH, "r", encoding="utf-8") as fp:
+            parts = (fp.read() or "").split()
+        pid = int(parts[0]) if parts else 0
+        ct = int(parts[1]) if len(parts) > 1 else 0
+    except Exception:
+        return 0
+    if not pid or not _pid_alive(pid):
+        return 0
+    if ct:
+        return pid if _proc_create_time(pid) == ct else 0
+    # 旧版 pid 文件只有 PID：至少确认那是个 Python 进程，否则当作过期文件
+    name = os.path.basename(_proc_image_path(pid)).lower()
+    return pid if name in ("python.exe", "pythonw.exe") else 0
 
 
 def guard_running():
@@ -1963,7 +2012,12 @@ def stop_popup_guard():
         pass
     pid = guard_pid()
     if not pid:
+        try:
+            os.remove(GUARD_PID_PATH)              # 过期的 pid 文件顺手清掉
+        except Exception:
+            pass
         return True, "守护没在运行"
+    ct = _proc_create_time(pid)
     try:
         ensure_dirs()
         with open(GUARD_STOP_PATH, "w", encoding="utf-8") as fp:
@@ -1975,6 +2029,13 @@ def stop_popup_guard():
         if not _pid_alive(pid):
             log_line("popup guard stopped pid=%d" % pid)
             return True, "守护已停止"
+    # 强杀前再核对一次身份：等待的这 3 秒里守护可能已退出、PID 被别人拿走
+    if not ct:
+        log_line("popup guard pid=%d not responding, identity unknown, skip terminate" % pid)
+        return False, "守护没有响应停止请求，且无法确认进程身份，未强制结束（可在托盘里退出）"
+    if _proc_create_time(pid) != ct:
+        log_line("popup guard pid=%d identity changed, skip terminate" % pid)
+        return True, "守护已停止"
     try:
         h = _K.OpenProcess(0x0001, False, pid)      # PROCESS_TERMINATE
         if h:
@@ -4114,11 +4175,17 @@ def _set_service_delayed(name, on, dry_run=False):
         with winreg.OpenKey(HKLM, path, 0, winreg.KEY_SET_VALUE) as k:
             winreg.SetValueEx(k, "DelayedAutoStart", 0, winreg.REG_DWORD, want)
     except OSError:
-        ps = ("$p='HKLM:\\SYSTEM\\CurrentControlSet\\Services\\%s';"
-              "Set-ItemProperty $p -Name DelayedAutoStart -Value %d -Type DWord -ErrorAction SilentlyContinue;"
-              "(Get-ItemProperty $p -Name DelayedAutoStart -ErrorAction SilentlyContinue).DelayedAutoStart"
-              % (name, want))
-        run_ps(ps, timeout=60)
+        # 和 _set_service_start 同一口径：服务名经 env 传入，不拼进脚本字符串；
+        # 用 -LiteralPath，避免服务名里的 [ ] 被当成通配符
+        env = dict(os.environ)
+        env["BD_SVC"] = name
+        env["BD_VAL"] = str(want)
+        ps = ("$p='HKLM:\\SYSTEM\\CurrentControlSet\\Services\\'+$env:BD_SVC;"
+              "Set-ItemProperty -LiteralPath $p -Name DelayedAutoStart -Value ([int]$env:BD_VAL)"
+              " -Type DWord -ErrorAction SilentlyContinue;"
+              "(Get-ItemProperty -LiteralPath $p -Name DelayedAutoStart"
+              " -ErrorAction SilentlyContinue).DelayedAutoStart")
+        run_ps(ps, timeout=60, env=env)
     now = _read_delayed(name)
     if now == want:
         return True, "%s：延迟启动已%s" % (name, "开启" if want else "关闭")
@@ -4629,11 +4696,10 @@ def apply_fixes(findings, backup_dir, progress=None, dry_run=False):
                     if dry_run:
                         res["msgs"].append("[试运行] 禁用任务：%s" % n)
                         continue
-                    nn = n.replace("'", "''")
-                    out = run_ps("Disable-ScheduledTask -TaskName '%s' -ErrorAction Stop | Out-Null; 'OK'" % nn,
-                                 timeout=60)
-                    ok = "OK" in out
-                    res["msgs"].append(("已禁用任务：%s" % n) if ok else ("任务禁用失败：%s" % n))
+                    # 任务名可由任何普通权限程序随意起，必须经 env 传入。
+                    # 只把 ' 换成 '' 不够：PowerShell 把 ‘ ’ ‚ ‛ 也当单引号
+                    ok, msg = _set_task_enabled(n, False)
+                    res["msgs"].append(msg)
                     res["ok"] = res["ok"] and ok
             elif t == "svc_delay":
                 for n in fx["items"]:
@@ -4786,10 +4852,8 @@ def restore_backup(backup_dir, progress=None, dry_run=False):
                 if dry_run:
                     res["msgs"].append("[试运行] 启用任务：%s" % it.get("name"))
                 else:
-                    nn = str(it.get("name", "")).replace("'", "''")
-                    out = run_ps("Enable-ScheduledTask -TaskName '%s' -ErrorAction Stop | Out-Null; 'OK'" % nn)
-                    res["msgs"].append(("已启用任务：%s" % it.get("name")) if "OK" in out
-                                       else ("任务启用失败：%s（可能已删除）" % it.get("name")))
+                    ok, msg = _set_task_enabled(str(it.get("name", "")), True)
+                    res["msgs"].append(msg if ok else msg + "（可能已删除）")
             elif k == "svc_delay":
                 name = it["name"]
                 if dry_run:

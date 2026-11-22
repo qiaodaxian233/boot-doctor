@@ -16,6 +16,7 @@
 停止：托盘菜单退出，或由主程序写 _logs\\popup_guard.stop
 """
 import ctypes
+import ctypes.wintypes as wt
 import os
 import sys
 import time
@@ -31,6 +32,40 @@ from PyQt5.QtWidgets import (QAction, QApplication, QMenu, QMessageBox,  # noqa:
 
 GL = os.path.join(HERE, "_logs", "popup_guard.log")
 WM_CLOSE = 0x0010
+ERROR_ACCESS_DENIED = 5
+ERROR_ALREADY_EXISTS = 183
+
+# 事件钩子：窗口一显示就收到通知，不用靠轮询碰运气。
+# WINEVENT_OUTOFCONTEXT = 不注入任何进程，回调走本线程的消息循环（Qt 事件循环会泵它），
+# 和「不注入、不挂全局钩子」的安全边界一致。
+EVENT_OBJECT_SHOW = 0x8002
+WINEVENT_OUTOFCONTEXT = 0x0000
+WINEVENT_SKIPOWNPROCESS = 0x0002
+OBJID_WINDOW = 0
+CHILDID_SELF = 0
+GA_ROOT = 2
+
+# 单独的 WinDLL 实例 + use_last_error：GetLastError 才可靠，
+# 也不会改到 boot_core 里共用的 ctypes.windll.user32 函数签名
+_u32 = ctypes.WinDLL("user32", use_last_error=True)
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+WinEventProc = ctypes.WINFUNCTYPE(None, wt.HANDLE, wt.DWORD, wt.HWND, wt.LONG,
+                                  wt.LONG, wt.DWORD, wt.DWORD)
+_u32.SetWinEventHook.restype = wt.HANDLE
+_u32.SetWinEventHook.argtypes = [wt.UINT, wt.UINT, wt.HMODULE, WinEventProc,
+                                 wt.DWORD, wt.DWORD, wt.UINT]
+_u32.UnhookWinEvent.restype = wt.BOOL
+_u32.UnhookWinEvent.argtypes = [wt.HANDLE]
+_u32.GetAncestor.restype = wt.HWND
+_u32.GetAncestor.argtypes = [wt.HWND, wt.UINT]
+_u32.PostMessageW.restype = wt.BOOL
+_u32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+_u32.IsWindow.restype = wt.BOOL
+_u32.IsWindow.argtypes = [wt.HWND]
+_u32.IsWindowVisible.restype = wt.BOOL
+_u32.IsWindowVisible.argtypes = [wt.HWND]
+_k32.CreateMutexW.restype = wt.HANDLE
+_k32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
 SILENT = "--silent" in sys.argv        # 开机自启走的模式：不弹任何窗口 / 对话框
 
 
@@ -66,8 +101,13 @@ class Guard(QApplication):
         self.closed = {}            # hwnd -> (time, count)
         self.seen = {}              # proc|title -> time（窗口记录去重用）
         self.blocked = 0
+        self.failed = 0             # PostMessage 被拒（多为权限不足 / UIPI）
         self.skipped = 0
         self.paused = False
+        self._pending = set()       # 事件钩子报上来、等待判定的 hwnd
+        self._hook = None
+        self._hook_proc = None      # 必须持有引用，否则回调被 GC 后进程直接崩
+        self._rules_mtime = None
         self.rules = bc.load_popup_rules()
         self.paused = not bool(self.rules.get("enabled"))
         if self.paused and SILENT:
@@ -112,21 +152,96 @@ class Guard(QApplication):
             self.act_state.setText("状态：已暂停")
             self.tray.setIcon(make_icon("#8a8f98"))
 
+        self.install_hook()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
-        self.timer.start(max(600, int(self.rules.get("poll_ms") or 1200)))
+        self.timer.start(self.poll_interval())
+        # 停止标记单独用一个轻量定时器查：有钩子时全量扫描会放慢到 5 秒，
+        # 不能让主程序的「停止」也跟着等 5 秒（它只等 3 秒就会走强杀）
+        self.stop_timer = QTimer(self)
+        self.stop_timer.timeout.connect(self.check_stop)
+        self.stop_timer.start(500)
+        self.aboutToQuit.connect(self.cleanup)   # 注销 / 关机时也会触发
 
         try:
-            os.makedirs(os.path.dirname(bc.GUARD_PID_PATH), exist_ok=True)
-            with open(bc.GUARD_PID_PATH, "w", encoding="utf-8") as fp:
-                fp.write(str(os.getpid()))
+            bc.write_guard_pid()
         except Exception:
             pass
         self.update_tip()
-        glog("守护启动 pid=%d 规则 block=%d allow=%d auto=%s"
-             % (os.getpid(), len(self.rules.get("block") or []),
+        glog("守护启动 pid=%d 管理员=%s 事件钩子=%s 规则 block=%d allow=%d auto=%s"
+             % (os.getpid(), bc.is_admin(), "on" if self._hook else "off(轮询)",
+                len(self.rules.get("block") or []),
                 len(self.rules.get("allow") or []), self.rules.get("auto_adware")))
+        if not bc.is_admin():
+            glog("提示：守护以普通权限运行，以管理员身份运行的程序弹出的窗口关不掉（UIPI 限制）")
         self.tick(force=True)
+
+    # ---------------- 事件钩子 ----------------
+    def install_hook(self):
+        try:
+            self._hook_proc = WinEventProc(self.on_win_event)
+            self._hook = _u32.SetWinEventHook(
+                EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, None, self._hook_proc, 0, 0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
+        except Exception as e:
+            glog("安装事件钩子失败，退回纯轮询：%r" % (e,))
+            self._hook = None
+        if not self._hook:
+            self._hook_proc = None
+
+    def poll_interval(self):
+        base = max(600, int(self.rules.get("poll_ms") or 1200))
+        # 有钩子时轮询只是兜底（补漏 + 写窗口记录），放慢到 5 秒省 CPU
+        return max(base, 5000) if self._hook else base
+
+    def on_win_event(self, _hook, _event, hwnd, id_object, id_child, _tid, _ms):
+        """EVENT_OBJECT_SHOW 回调。这里只做最便宜的过滤，判定延后到 Qt 定时器里。
+
+        ctypes 回调里抛异常不会传出去，只会打印到（不存在的）控制台，所以整段兜住。
+        """
+        try:
+            if self.paused or not hwnd:
+                return
+            if id_object != OBJID_WINDOW or id_child != CHILDID_SELF:
+                return                              # 子控件 / 光标 / 插入符，占事件的绝大多数
+            if _u32.GetAncestor(hwnd, GA_ROOT) != hwnd:
+                return                              # 只看顶层窗口
+            h = int(hwnd)
+            if h in self._pending:
+                return
+            self._pending.add(h)
+            # 稍等一下再判定：不少弹窗先 Show 再设标题 / 挪位置
+            QTimer.singleShot(150, lambda h=h: self.check_one(h))
+        except Exception:
+            pass
+
+    def check_one(self, hwnd):
+        self._pending.discard(hwnd)
+        if self.paused:
+            return
+        self.reload_rules()
+        try:
+            w = bc._win_item(hwnd, include_hidden=False)
+        except Exception:
+            w = None
+        if not w:
+            return
+        rows = []
+        self.handle(w, time.time(), rows)
+        try:
+            bc.append_popup_watch(rows)
+        except Exception:
+            pass
+
+    def reload_rules(self):
+        """规则文件没改就不重读（以前每轮都 json.load 一次）。"""
+        try:
+            mt = os.path.getmtime(bc.POPUP_RULES_PATH)
+        except OSError:
+            mt = None
+        if mt != self._rules_mtime:
+            self._rules_mtime = mt
+            self.rules = bc.load_popup_rules()
 
     # ---------------- 托盘动作 ----------------
     def toggle_pause(self):
@@ -138,8 +253,10 @@ class Guard(QApplication):
         glog("暂停" if self.paused else "恢复")
 
     def update_tip(self):
-        self.tray.setToolTip("弹窗拦截 · %s · 已拦 %d 个"
-                             % ("已暂停" if self.paused else "守护中", self.blocked))
+        tip = "弹窗拦截 · %s · 已拦 %d 个" % ("已暂停" if self.paused else "守护中", self.blocked)
+        if self.failed:
+            tip += " · %d 个关不掉（见日志）" % self.failed
+        self.tray.setToolTip(tip)
 
     def open_log(self):
         try:
@@ -174,29 +291,40 @@ class Guard(QApplication):
         self.quit()
 
     def cleanup(self):
-        try:
-            os.remove(bc.GUARD_PID_PATH)
-        except Exception:
-            pass
-
-    # ---------------- 主循环 ----------------
-    def tick(self, force=False):
-        # 主程序要求停止
-        if os.path.exists(bc.GUARD_STOP_PATH):
+        if self._hook:
             try:
-                os.remove(bc.GUARD_STOP_PATH)
+                _u32.UnhookWinEvent(self._hook)
             except Exception:
                 pass
-            glog("收到停止标记，退出")
-            self.cleanup()
-            self.quit()
+            self._hook = None
+        # 只删属于自己的 pid 文件：新守护可能已经覆盖写过了
+        if bc.guard_pid() in (0, os.getpid()):
+            try:
+                os.remove(bc.GUARD_PID_PATH)
+            except Exception:
+                pass
+
+    # ---------------- 主循环 ----------------
+    def check_stop(self):
+        """主程序要求停止（写了 stop 标记）。"""
+        if not os.path.exists(bc.GUARD_STOP_PATH):
             return
+        try:
+            os.remove(bc.GUARD_STOP_PATH)
+        except Exception:
+            pass
+        glog("收到停止标记，退出")
+        self.cleanup()
+        self.quit()
+
+    def tick(self, force=False):
+        """全量扫一遍：有事件钩子时是兜底，没有钩子时就是主力。"""
         if self.paused and not force:
             return
-        # 规则可能被主程序改过，每轮重读（文件很小）
-        self.rules = bc.load_popup_rules()
-        if self.timer.interval() != int(self.rules.get("poll_ms") or 1200):
-            self.timer.setInterval(max(600, int(self.rules.get("poll_ms") or 1200)))
+        self.reload_rules()                  # 规则可能被主程序改过
+        want = self.poll_interval()
+        if self.timer.interval() != want:
+            self.timer.setInterval(want)
         try:
             wins = bc.enum_popups(include_hidden=False, limit=300)
         except Exception as e:
@@ -205,44 +333,7 @@ class Guard(QApplication):
         now = time.time()
         rows = []
         for w in wins:
-            # 窗口记录（火绒同款）：把见过的窗口留一笔，事后能回溯"刚才是谁弹的"
-            try:
-                t = (w.get("title") or "").strip()
-                if t:
-                    key = ((w.get("proc") or "") + "|" + t)[:200]
-                    if now - self.seen.get(key, 0) > 600:
-                        self.seen[key] = now
-                        if len(rows) < 20:
-                            rows.append({
-                                "t": time.strftime("%m-%d %H:%M:%S"),
-                                "title": t[:80], "proc": w.get("proc") or "",
-                                "cls": w.get("cls") or "", "judge": w.get("judge") or "",
-                                "path": (w.get("path") or "")[:200],
-                            })
-            except Exception:
-                pass
-            try:
-                ok, why = bc.should_close_popup(w, self.rules)
-            except Exception:
-                continue
-            if not ok:
-                continue
-            hwnd = int(w.get("hwnd") or 0)
-            if not hwnd:
-                continue
-            last = self.closed.get(hwnd)
-            if last and now - last[0] < 30:
-                continue
-            self.closed[hwnd] = (now, (last[1] + 1) if last else 1)
-            try:
-                ctypes.windll.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
-            except Exception as e:
-                glog("关闭失败 hwnd=%s %r" % (hwnd, e))
-                continue
-            self.blocked += 1
-            glog("拦截「%s」 proc=%s pid=%s 原因=%s"
-                 % ((w.get("title") or "")[:60], w.get("proc"), w.get("pid"), why))
-            self.update_tip()
+            self.handle(w, now, rows)
         # 清理过期记录，避免字典无限增长
         if len(self.closed) > 500:
             self.closed = {k: v for k, v in self.closed.items() if now - v[0] < 600}
@@ -250,6 +341,61 @@ class Guard(QApplication):
             self.seen = {k: v for k, v in self.seen.items() if now - v < 3600}
         try:
             bc.append_popup_watch(rows)
+        except Exception:
+            pass
+
+    def handle(self, w, now, rows):
+        """单个窗口：先记一笔窗口记录，再判定要不要关。轮询和事件钩子共用这一段。"""
+        # 窗口记录（火绒同款）：把见过的窗口留一笔，事后能回溯"刚才是谁弹的"
+        try:
+            t = (w.get("title") or "").strip()
+            if t:
+                key = ((w.get("proc") or "") + "|" + t)[:200]
+                if now - self.seen.get(key, 0) > 600:
+                    self.seen[key] = now
+                    if len(rows) < 20:
+                        rows.append({
+                            "t": time.strftime("%m-%d %H:%M:%S"),
+                            "title": t[:80], "proc": w.get("proc") or "",
+                            "cls": w.get("cls") or "", "judge": w.get("judge") or "",
+                            "path": (w.get("path") or "")[:200],
+                        })
+        except Exception:
+            pass
+        try:
+            ok, why = bc.should_close_popup(w, self.rules)
+        except Exception:
+            return
+        if not ok:
+            return
+        hwnd = int(w.get("hwnd") or 0)
+        if not hwnd:
+            return
+        last = self.closed.get(hwnd)
+        if last and now - last[0] < 30:
+            return
+        self.closed[hwnd] = (now, (last[1] + 1) if last else 1)
+        title = (w.get("title") or "")[:60]
+        if not _u32.PostMessageW(hwnd, WM_CLOSE, 0, 0):
+            # 以前这里不看返回值，发失败了也算「已拦」，统计和日志都是虚的
+            err = ctypes.get_last_error()
+            self.failed += 1
+            reason = ("权限不足：对方以管理员身份运行，守护是普通权限（UIPI）"
+                      if err == ERROR_ACCESS_DENIED else "错误码 %d" % err)
+            glog("关闭失败「%s」 proc=%s pid=%s %s" % (title, w.get("proc"), w.get("pid"), reason))
+            self.update_tip()
+            return
+        self.blocked += 1
+        glog("拦截「%s」 proc=%s pid=%s 原因=%s" % (title, w.get("proc"), w.get("pid"), why))
+        self.update_tip()
+        # PostMessage 成功只代表消息进了队列；1.5 秒后看窗口是不是真没了
+        QTimer.singleShot(1500, lambda h=hwnd, t=title, p=w.get("proc"): self.verify_closed(h, t, p))
+
+    def verify_closed(self, hwnd, title, proc):
+        try:
+            if _u32.IsWindow(hwnd) and _u32.IsWindowVisible(hwnd):
+                glog("已发送关闭但窗口还在「%s」 proc=%s：对方忽略了 WM_CLOSE，"
+                     "建议直接禁用它的启动项或卸载" % (title, proc))
         except Exception:
             pass
 
@@ -261,12 +407,11 @@ def single_instance():
     """同名互斥体，防止点两次开两个守护互相打架。"""
     global _MUTEX
     try:
-        k32 = ctypes.windll.kernel32
-        # CreateMutexW 成功时不会把 LastError 清零，线程里可能残留上一次的 183，
-        # 不先清零会把「首次启动」误判成「已有实例」直接退出
-        k32.SetLastError(0)
-        _MUTEX = k32.CreateMutexW(None, False, "Local\\BootDoctorPopupGuard")
-        return k32.GetLastError() != 183   # ERROR_ALREADY_EXISTS
+        # use_last_error=True：ctypes 在调用返回的那一刻就把 LastError 存进线程私有副本，
+        # 不会被解释器在两次外部调用之间的其他 API 改掉。比手动 SetLastError(0) 可靠
+        ctypes.set_last_error(0)
+        _MUTEX = _k32.CreateMutexW(None, False, "Local\\BootDoctorPopupGuard")
+        return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
     except Exception:
         return True
 
