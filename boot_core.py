@@ -2132,6 +2132,184 @@ def popup_log_tail(n=40):
 
 
 # --------------------------------------------------------------------------
+# 通知管理：右下角的系统通知（Toast）不是独立窗口，弹窗守护拦不到。
+# 但 Windows 允许按应用关掉：HKCU\...\Notifications\Settings\<应用 ID> 下 Enabled=0，
+# 和「设置 → 系统 → 通知」里关掉某个应用是同一个开关。
+# --------------------------------------------------------------------------
+NOTIFY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Notifications\Settings"
+
+# 应用 ID 里常见的已知文件夹 GUID（Win32 程序没自报 ID 时，系统用「已知文件夹 + 相对路径」当 ID）
+_KNOWN_FOLDER_ENV = {
+    "{6D809377-6AF0-444B-8957-A3773F02200E}": ("ProgramW6432", "ProgramFiles"),
+    "{905E63B6-C1BF-494E-B29C-65B732D3D21A}": ("ProgramFiles",),
+    "{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}": ("ProgramFiles(x86)",),
+    "{F38BF404-1D43-42F2-9305-67DE0B28FC23}": ("SystemRoot",),
+    "{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}": ("LOCALAPPDATA",),
+    "{3EB685DB-65F9-4CF6-A03A-E3EF65729F3D}": ("APPDATA",),
+    "{5E6C858F-0E22-4760-9AFE-EA3317B67173}": ("USERPROFILE",),
+}
+_KNOWN_FOLDER_SUB = {
+    "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}": ("SystemRoot", "System32"),
+    "{D65231B0-B2F1-4857-A4CE-A8E7C6EA7D27}": ("SystemRoot", "SysWOW64"),
+}
+_SYSTOAST_CN = {
+    "Windows.SystemToast.SecurityAndMaintenance": "安全和维护",
+    "Windows.SystemToast.AutoPlay": "自动播放",
+    "Windows.SystemToast.BackgroundAccess": "后台活动",
+    "Windows.SystemToast.BdeUnlock": "BitLocker",
+    "Windows.SystemToast.Calling": "通话",
+    "Windows.SystemToast.Devices": "设备",
+    "Windows.SystemToast.HelloFace": "Windows Hello",
+    "Windows.SystemToast.LowDisk": "磁盘空间不足",
+    "Windows.SystemToast.Print.Notification": "打印",
+    "Windows.SystemToast.Share": "共享",
+    "Windows.SystemToast.StartupApp": "启动应用",
+    "Windows.SystemToast.Suggested": "建议",
+    "Windows.SystemToast.WiFiNetworkManager": "无线网络",
+    "Windows.Defender.SecurityCenter": "Windows 安全中心",
+    "Microsoft.Windows.Explorer": "文件资源管理器",
+}
+
+
+def _expand_aumid_path(aumid):
+    """「{已知文件夹 GUID}\\相对路径」形式的应用 ID → 真实 exe 路径；不是这种形式返回 ''。"""
+    m = re.match(r"^(\{[0-9A-Fa-f-]{36}\})\\(.+)$", aumid or "")
+    if not m:
+        return ""
+    g, rest = m.group(1).upper(), m.group(2)
+    base = ""
+    for k in _KNOWN_FOLDER_ENV.get(g, ()):
+        base = os.environ.get(k) or ""
+        if base:
+            break
+    if not base and g in _KNOWN_FOLDER_SUB:
+        env, sub = _KNOWN_FOLDER_SUB[g]
+        root = os.environ.get(env) or ""
+        base = os.path.join(root, sub) if root else ""
+    return os.path.join(base, rest) if base else ""
+
+
+def _load_indirect(s):
+    """解析 @{...} / @dll,-id 这类间接资源字符串；失败原样返回。"""
+    if not s or not s.startswith("@"):
+        return s
+    try:
+        buf = ctypes.create_unicode_buffer(512)
+        sh = ctypes.WinDLL("shlwapi")
+        sh.SHLoadIndirectString.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p,
+                                            ctypes.c_uint, ctypes.c_void_p]
+        sh.SHLoadIndirectString.restype = ctypes.c_long
+        if sh.SHLoadIndirectString(s, buf, 512, None) == 0 and buf.value:
+            return buf.value
+    except Exception:
+        pass
+    return s
+
+
+def _aumid_display(aumid):
+    """应用 ID → (显示名, exe 路径, 发布者)。"""
+    if aumid in _SYSTOAST_CN:
+        return _SYSTOAST_CN[aumid], "", "Microsoft Corporation"
+    path = _expand_aumid_path(aumid)
+    if path:
+        info = _file_version_info(path) if os.path.isfile(path) else {}
+        name = (info or {}).get("FileDescription") or os.path.basename(path)
+        return name, path, (info or {}).get("CompanyName") or ""
+    for root in (HKCU, HKLM):
+        dn = _reg_str(root, r"Software\Classes\AppUserModelId" + "\\" + aumid, "DisplayName")
+        if dn:
+            return _load_indirect(dn), "", ""
+    if aumid.startswith("Windows.SystemToast."):
+        return aumid[len("Windows.SystemToast."):], "", "Microsoft Corporation"
+    if "!" in aumid:                                    # 商店应用：包族名!应用名
+        fam = aumid.split("!", 1)[0].split("_", 1)[0]
+        pub = "Microsoft Corporation" if fam.lower().startswith("microsoft.") else ""
+        return fam.split(".", 1)[-1] if "." in fam else fam, "", pub
+    return aumid, "", ""
+
+
+def _filetime_str(v):
+    try:
+        v = int(v)
+        if v <= 0:
+            return ""
+        t = _dt.datetime(1601, 1, 1, tzinfo=_dt.timezone.utc) + _dt.timedelta(microseconds=v // 10)
+        return t.astimezone().strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
+
+
+def _notify_keys(root_sub, sub="", depth=0):
+    """递归找出所有「应用」键。
+
+    应用 ID 本身可能带反斜杠（{GUID}\\路径\\xx.exe），在注册表里会变成多级子键，
+    所以不能只看第一层：有值的键、或没有子键的叶子键，才是一个应用。
+    """
+    full = root_sub + ("\\" + sub if sub else "")
+    try:
+        k = winreg.OpenKey(HKCU, full, 0, winreg.KEY_READ)
+    except OSError:
+        return
+    with k:
+        n_sub, n_val, _ = winreg.QueryInfoKey(k)
+        vals = {}
+        for i in range(n_val):
+            try:
+                name, val, _t = winreg.EnumValue(k, i)
+                vals[name] = val
+            except OSError:
+                break
+        subs = []
+        for i in range(n_sub):
+            try:
+                subs.append(winreg.EnumKey(k, i))
+            except OSError:
+                break
+    if sub and (vals or not subs):
+        yield sub, vals
+    if depth < 6:
+        for c in subs:
+            yield from _notify_keys(root_sub, (sub + "\\" + c) if sub else c, depth + 1)
+
+
+def list_notify_apps(root_sub=None):
+    """列出注册过通知的应用：[{aumid, name, path, company, enabled, last, adware, system}]。
+
+    排序：命中流氓软件特征库的在前，其次按最近一次发通知的时间倒序。
+    """
+    out = []
+    for aumid, vals in _notify_keys(root_sub or NOTIFY_KEY):
+        name, path, company = _aumid_display(aumid)
+        en = vals.get("Enabled")
+        last = vals.get("LastNotificationAddedTime")
+        hit = adware_check(path=path, name=name, company=company) if (path or company) else {}
+        system = (company.lower().startswith("microsoft") or aumid.startswith("Windows.")
+                  or aumid.startswith("Microsoft.Windows."))
+        out.append({
+            "aumid": aumid, "name": name, "path": path, "company": company,
+            "enabled": not (isinstance(en, int) and en == 0),
+            "last": _filetime_str(last) if last else "",
+            "last_raw": int(last) if isinstance(last, int) else 0,
+            "adware": (hit or {}).get("label", "") if (hit or {}).get("hit") else "",
+            "system": bool(system),
+        })
+    out.sort(key=lambda x: (not x["adware"], -x["last_raw"], x["name"].lower()))
+    return out
+
+
+def set_notify_enabled(aumid, on, root_sub=None):
+    """开 / 关某个应用的系统通知。返回 (ok, msg)。只写 HKCU，不需要管理员。"""
+    sub = (root_sub or NOTIFY_KEY) + "\\" + aumid
+    try:
+        with winreg.CreateKeyEx(HKCU, sub, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, "Enabled", 0, winreg.REG_DWORD, 1 if on else 0)
+    except OSError as e:
+        return False, "写注册表失败：%s" % e
+    log_line("notify %s -> %s" % (aumid, "on" if on else "off"))
+    return True, ("已允许通知：%s" if on else "已关闭通知：%s") % aumid
+
+
+# --------------------------------------------------------------------------
 # 采集 2：服务（注册表直读，含镜像文件存在性）
 # --------------------------------------------------------------------------
 

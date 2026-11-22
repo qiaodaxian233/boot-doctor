@@ -1534,6 +1534,125 @@ class TestEventsQuery(unittest.TestCase):
                          [x.get("msg") for x in _as_list(old.get("scm"))])
 
 
+class TestNotify(unittest.TestCase):
+    """通知管理：在一个临时注册表位置上真读真写，不碰真实的通知设置。"""
+    ROOT = r"Software\BootDoctorUnitTest\Notifications\Settings"
+    NESTED = r"{6D809377-6AF0-444B-8957-A3773F02200E}\UnitTestVendor\ut_app.exe"
+
+    def setUp(self):
+        import winreg
+        self.wr = winreg
+        bc._delete_key_tree(winreg.HKEY_CURRENT_USER, r"Software\BootDoctorUnitTest")
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, self.ROOT + r"\UnitTest.PlainApp") as k:
+            winreg.SetValueEx(k, "LastNotificationAddedTime", 0, winreg.REG_QWORD,
+                              133500000000000000)
+        # 应用 ID 带反斜杠时，注册表里是多级子键，只有最里层有值
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, self.ROOT + "\\" + self.NESTED) as k:
+            winreg.SetValueEx(k, "LastNotificationAddedTime", 0, winreg.REG_QWORD,
+                              133600000000000000)
+
+    def tearDown(self):
+        bc._delete_key_tree(self.wr.HKEY_CURRENT_USER, r"Software\BootDoctorUnitTest")
+
+    def _by_id(self):
+        return {a["aumid"]: a for a in bc.list_notify_apps(self.ROOT)}
+
+    def test_list_nested_and_plain(self):
+        apps = self._by_id()
+        self.assertEqual(set(apps), {"UnitTest.PlainApp", self.NESTED},
+                         "多级子键没有拼回完整的应用 ID，或者把中间层当成了应用")
+        nested = apps[self.NESTED]
+        self.assertTrue(nested["path"].lower().endswith(r"unittestvendor\ut_app.exe"), nested["path"])
+        self.assertTrue(nested["enabled"], "没写 Enabled 的应用默认是允许通知")
+        self.assertTrue(nested["last"].startswith("20"), nested["last"])
+        ids = [a["aumid"] for a in bc.list_notify_apps(self.ROOT)]
+        self.assertEqual(ids[0], self.NESTED, "应按最近一次通知时间倒序")
+
+    def test_toggle_roundtrip(self):
+        ok, msg = bc.set_notify_enabled(self.NESTED, False, self.ROOT)
+        self.assertTrue(ok, msg)
+        self.assertFalse(self._by_id()[self.NESTED]["enabled"])
+        self.assertTrue(self._by_id()["UnitTest.PlainApp"]["enabled"], "关一个不能影响别的")
+        ok, msg = bc.set_notify_enabled(self.NESTED, True, self.ROOT)
+        self.assertTrue(ok, msg)
+        self.assertTrue(self._by_id()[self.NESTED]["enabled"])
+
+    def test_page_toggles_selected(self):
+        from PyQt5.QtWidgets import QApplication
+        import boot_doctor as bd
+        app = QApplication.instance() or QApplication([])  # noqa: F841
+        page = bd.NotifyPage(root_sub=self.ROOT)
+        self.assertEqual(page.tree.topLevelItemCount(), 2)
+        page.tree.topLevelItem(0).setSelected(True)
+        page.set_selected(False)
+        self.assertEqual(page.stats()["on"], 1)
+        page.close()
+
+
+class TestNavPages(unittest.TestCase):
+    """左侧导航：每页都能打开，弹窗页是嵌进来的（不是弹出窗口），过滤控件只在体检页显示。"""
+
+    def test_pages(self):
+        from PyQt5.QtWidgets import QApplication
+        import boot_doctor as bd
+        app = QApplication.instance() or QApplication([])
+        win = bd.MainWindow(autoscan=False)
+        win.show()
+        try:
+            self.assertEqual(win.nav.count(), 4)
+            self.assertNotIn("popup", win._page_built, "弹窗页应在第一次打开时才建（启动不枚举窗口）")
+            for key in ("popup", "notify", "backup", "scan"):
+                win.show_page(key)
+                app.processEvents()
+                self.assertEqual(win.current_page(), key)
+                self.assertIs(win.pages.currentWidget(), win.page_widget(key))
+                for act in win._scan_only_acts:
+                    self.assertEqual(act.isVisible(), key == "scan",
+                                     "%s 页上体检过滤控件的显示状态不对" % key)
+            pop = win.page_widget("popup")
+            self.assertIsInstance(pop, bd.PopupDialog)
+            self.assertFalse(pop.isWindow(), "弹窗拦截页应嵌在主窗口里，不是独立窗口")
+            win.on_popup_dialog()              # 菜单入口：跳页，不再弹模态框
+            self.assertEqual(win.current_page(), "popup")
+        finally:
+            win.close()
+
+    def test_badges_after_scan(self):
+        from PyQt5.QtWidgets import QApplication
+        import boot_doctor as bd
+        app = QApplication.instance() or QApplication([])  # noqa: F841
+        win = bd.MainWindow(autoscan=False)
+        try:
+            raw = fake_raw()
+            res = bc.analyze(raw)
+            win.on_scan_done(raw, res)
+            self.assertIn(str(res["score"]), win.nav.item(0).text())
+        finally:
+            win.close()
+
+    def test_backup_page_lists(self):
+        from PyQt5.QtWidgets import QApplication
+        import boot_doctor as bd
+        app = QApplication.instance() or QApplication([])  # noqa: F841
+        old = bc.BACKUP_DIR
+        with tempfile.TemporaryDirectory() as td:
+            bc.BACKUP_DIR = td
+            try:
+                fs = [{"id": "t1", "title": "T1", "fix": {"type": "svc_start", "risk": "safe",
+                                                         "items": {"luafv": 3}}}]
+                bc.make_backup(fs, backup_root=td, tag="ut")
+                win = bd.MainWindow(autoscan=False)
+                try:
+                    page = win.page_widget("backup")
+                    self.assertEqual(page.tree.topLevelItemCount(), 1)
+                    self.assertTrue(page.btn_restore.isEnabled())
+                    self.assertIn("1", win.nav.item(3).text())
+                finally:
+                    win.close()
+            finally:
+                bc.BACKUP_DIR = old
+
+
 class TestLauncher(unittest.TestCase):
     def test_bat_finds_python(self):
         """启动体检.bat 去掉了写死的路径兜底后，必须还能找到 pythonw（真跑一遍 bat 的查找逻辑）。"""

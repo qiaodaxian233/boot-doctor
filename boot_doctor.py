@@ -28,7 +28,8 @@ from PyQt5.QtWidgets import (
     QDialog, QDialogButtonBox, QFileDialog, QFileIconProvider, QFrame, QGridLayout, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton, QSizePolicy,
-    QSpinBox, QSplitter, QStyle, QTabWidget, QTextBrowser, QToolBar, QTreeWidget,
+    QSpinBox, QSplitter, QStackedWidget, QStyle, QTabWidget, QTextBrowser, QToolBar,
+    QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -469,6 +470,13 @@ QLabel#hint { font-size: 11px; color: %(faint)s; }
 QLabel#adminOk { color: %(ok)s; font-size: 11px; }
 QLabel#adminNo { color: %(warn)s; font-size: 11px; }
 QLabel#appname { font-size: 13px; font-weight: 600; }
+QListWidget#nav { background: %(g_panel_soft)s; border: none;
+                  border-right: 1px solid %(g_line_soft)s; outline: 0; padding: 8px 6px; }
+QListWidget#nav::item { padding: 9px 10px; margin: 1px 0; border-radius: 7px;
+                        color: %(muted)s; }
+QListWidget#nav::item:hover { background: %(g_hover)s; color: %(text)s; }
+QListWidget#nav::item:selected { background: %(g_sel_grad)s; color: %(text)s; }
+QLabel#pageTitle { font-size: 15px; font-weight: 600; }
 QPushButton { background: %(g_btn)s; border: 1px solid %(g_line)s; border-radius: 6px;
               padding: 5px 14px; min-height: 16px; }
 QPushButton:hover { background: %(g_btn_hover)s; border-color: %(accent)s; }
@@ -643,7 +651,9 @@ class DialogChrome(QObject):
 
     def eventFilter(self, obj, ev):
         try:
-            if ev.type() == QEvent.Show and isinstance(obj, QDialog):
+            # 嵌进主窗口当页面用的对话框（弹窗拦截页）不是顶层窗口：对它调 winId()
+            # 会把它变成原生子窗口，在毛玻璃主窗口里会黑底 / 闪烁
+            if ev.type() == QEvent.Show and isinstance(obj, QDialog) and obj.isWindow():
                 _set_dark_title(int(obj.winId()), is_dark())
         except Exception:
             pass
@@ -1210,10 +1220,21 @@ class PopupDialog(QDialog):
         return ti.data(0, Qt.UserRole) if ti else None
 
     def _toggle_timer(self, state):
-        if state:
+        if state and self.isVisible():
             self._timer.start()
         else:
             self._timer.stop()
+
+    # 作为主窗口里的一页时，切到别的页就停掉自动刷新，切回来再接上（以前关了对话框才停）
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        if self.chk_auto.isChecked():
+            self._timer.start()
+        self._sync_guard()
+
+    def hideEvent(self, ev):
+        self._timer.stop()
+        super().hideEvent(ev)
 
     # ---------------- 操作 ----------------
     def on_close_win(self):
@@ -1442,6 +1463,227 @@ class PopupDialog(QDialog):
             QMessageBox.warning(self, "打不开规则文件", str(e))
 
 
+
+class NotifyPage(QWidget):
+    """通知管理：右下角的系统通知不是独立窗口，弹窗守护拦不到，这里按应用直接关。"""
+
+    COLS = ("通知", "应用", "发布者", "最近一次通知", "判定", "应用 ID")
+
+    def __init__(self, parent=None, root_sub=None):
+        super().__init__(parent)
+        self.root_sub = root_sub
+        self.apps = []
+        v = QVBoxLayout(self)
+        v.setContentsMargins(14, 12, 14, 10)
+        v.setSpacing(8)
+        t = QLabel("通知管理")
+        t.setObjectName("pageTitle")
+        v.addWidget(t)
+        hint = QLabel("右下角弹出的系统通知（含不少软件的「推荐」「热点」）不是独立窗口，弹窗拦截管不到。"
+                      "在这里按应用关掉，和「设置 → 系统 → 通知」里的开关是同一个。"
+                      "个别应用要注销重新登录后才完全生效。")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        self.btn_refresh = QPushButton("刷新")
+        self.btn_refresh.clicked.connect(self.refresh)
+        bar.addWidget(self.btn_refresh)
+        self.btn_off = QPushButton("关闭所选应用的通知")
+        self.btn_off.setObjectName("primary")
+        self.btn_off.clicked.connect(lambda: self.set_selected(False))
+        bar.addWidget(self.btn_off)
+        self.btn_on = QPushButton("恢复通知")
+        self.btn_on.clicked.connect(lambda: self.set_selected(True))
+        bar.addWidget(self.btn_on)
+        self.chk_hide_sys = QCheckBox("隐藏系统自带")
+        self.chk_hide_sys.setChecked(True)
+        self.chk_hide_sys.stateChanged.connect(lambda _s: self._fill())
+        bar.addWidget(self.chk_hide_sys)
+        bar.addStretch(1)
+        self.lbl_count = QLabel("")
+        self.lbl_count.setObjectName("hint")
+        bar.addWidget(self.lbl_count)
+        v.addLayout(bar)
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(len(self.COLS))
+        self.tree.setHeaderLabels(list(self.COLS))
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        hh = self.tree.header()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        for c in (1, 2, 3, 4):
+            hh.setSectionResizeMode(c, QHeaderView.Interactive)
+        hh.setSectionResizeMode(5, QHeaderView.Stretch)
+        self.tree.setColumnWidth(1, 230)
+        self.tree.setColumnWidth(2, 190)
+        self.tree.setColumnWidth(3, 130)
+        self.tree.setColumnWidth(4, 150)
+        self.tree.itemDoubleClicked.connect(lambda it, _c: self._toggle_item(it))
+        self.tree.itemSelectionChanged.connect(self._sync_buttons)
+        v.addWidget(self.tree, 1)
+        self.refresh()
+
+    def refresh(self):
+        try:
+            self.apps = bc.list_notify_apps(self.root_sub)
+        except Exception as e:
+            bc.log_line("list_notify_apps failed: %r" % (e,))
+            self.apps = []
+        self._fill()
+
+    def stats(self):
+        return {"total": len(self.apps),
+                "on": sum(1 for a in self.apps if a["enabled"]),
+                "adware_on": sum(1 for a in self.apps if a["enabled"] and a["adware"])}
+
+    def _fill(self):
+        self.tree.clear()
+        hide_sys = self.chk_hide_sys.isChecked()
+        shown = 0
+        for a in self.apps:
+            if hide_sys and a["system"] and not a["adware"]:
+                continue
+            it = QTreeWidgetItem([
+                "开" if a["enabled"] else "关", a["name"], a["company"], a["last"],
+                ("流氓软件：%s" % a["adware"]) if a["adware"] else "", a["aumid"]])
+            it.setData(0, Qt.UserRole, a["aumid"])
+            it.setToolTip(1, a["path"] or a["aumid"])
+            it.setForeground(0, QBrush(QColor(PAL["ok"] if a["enabled"] else PAL["faint"])))
+            if a["adware"]:
+                it.setForeground(4, QBrush(QColor(PAL["err"])))
+            self.tree.addTopLevelItem(it)
+            shown += 1
+        st = self.stats()
+        self.lbl_count.setText("显示 %d / 共 %d 个应用，%d 个允许通知" % (shown, st["total"], st["on"]))
+        self._sync_buttons()
+
+    def _sync_buttons(self):
+        n = len(self.tree.selectedItems())
+        self.btn_off.setEnabled(n > 0)
+        self.btn_on.setEnabled(n > 0)
+        self.btn_off.setText("关闭所选应用的通知" + ("（%d）" % n if n > 1 else ""))
+
+    def _toggle_item(self, it):
+        aumid = it.data(0, Qt.UserRole)
+        a = next((x for x in self.apps if x["aumid"] == aumid), None)
+        if a:
+            self._apply([aumid], not a["enabled"])
+
+    @guard
+    def set_selected(self, on):
+        ids = [it.data(0, Qt.UserRole) for it in self.tree.selectedItems()]
+        if ids:
+            self._apply(ids, on)
+
+    def _apply(self, ids, on):
+        fails = []
+        for aumid in ids:
+            ok, msg = bc.set_notify_enabled(aumid, on, self.root_sub)
+            if not ok:
+                fails.append(msg)
+        self.refresh()
+        if fails:
+            QMessageBox.warning(self, "通知管理", "\n".join(fails[:10]))
+        w = self.window()
+        if hasattr(w, "_sync_nav_badges"):
+            w._sync_nav_badges()
+
+
+class BackupPage(QWidget):
+    """备份与还原：每次修复前的快照都在这里，选一个就能回到当时的状态。"""
+
+    def __init__(self, main, parent=None):
+        super().__init__(parent)
+        self.main = main
+        v = QVBoxLayout(self)
+        v.setContentsMargins(14, 12, 14, 10)
+        v.setSpacing(8)
+        t = QLabel("备份与还原")
+        t.setObjectName("pageTitle")
+        v.addWidget(t)
+        hint = QLabel("每次执行修复前都会自动备份。还原会把这次修复改过的启动项、服务、计划任务改回原样。")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        self.btn_restore = QPushButton("还原所选备份")
+        self.btn_restore.setObjectName("primary")
+        self.btn_restore.clicked.connect(self.on_restore)
+        bar.addWidget(self.btn_restore)
+        self.btn_dir = QPushButton("打开备份目录")
+        self.btn_dir.clicked.connect(lambda: self.main.open_backup_dir())
+        bar.addWidget(self.btn_dir)
+        self.btn_refresh = QPushButton("刷新")
+        self.btn_refresh.clicked.connect(self.refresh)
+        bar.addWidget(self.btn_refresh)
+        bar.addStretch(1)
+        v.addLayout(bar)
+
+        split = QSplitter(Qt.Horizontal)
+        split.setChildrenCollapsible(False)
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(3)
+        self.tree.setHeaderLabels(["备份时间", "改动项数", "目录"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setUniformRowHeights(True)
+        hh = self.tree.header()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.Stretch)
+        self.tree.currentItemChanged.connect(lambda cur, _p: self._show(cur))
+        split.addWidget(self.tree)
+        self.detail = QTextBrowser()
+        self.detail.setOpenExternalLinks(False)
+        split.addWidget(self.detail)
+        split.setSizes([420, 520])
+        v.addWidget(split, 1)
+        self.refresh()
+
+    def refresh(self):
+        self.backups = bc.list_backups()
+        self.tree.clear()
+        for b in self.backups:
+            it = QTreeWidgetItem([b["created"] or b["name"], str(b["count"]), b["dir"]])
+            it.setData(0, Qt.UserRole, b["dir"])
+            self.tree.addTopLevelItem(it)
+        if self.backups:
+            self.tree.setCurrentItem(self.tree.topLevelItem(0))
+        else:
+            self.detail.setPlainText("还没有备份。执行第一次修复时会自动创建。")
+        self.btn_restore.setEnabled(bool(self.backups))
+
+    def _show(self, it):
+        if not it:
+            return
+        d = it.data(0, Qt.UserRole)
+        txt = ""
+        for fn in ("说明.txt", "README.txt"):
+            p = os.path.join(d, fn)
+            if os.path.isfile(p):
+                try:
+                    with open(p, "r", encoding="utf-8", errors="replace") as fp:
+                        txt = fp.read()
+                except OSError:
+                    pass
+                break
+        self.detail.setPlainText(txt or d)
+
+    @guard
+    def on_restore(self):
+        it = self.tree.currentItem()
+        if it:
+            self.main.restore_dir(it.data(0, Qt.UserRole))
+
+
 class MainWindow(QMainWindow):
     def __init__(self, autoscan=None):
         super().__init__()
@@ -1554,16 +1796,49 @@ class MainWindow(QMainWindow):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
 
-        v.addWidget(self._build_header())
+        # 左侧导航 + 右侧分页。「开机体检」页就是原来的整套界面，一行没改，只是搬进了第一页
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        self.nav = QListWidget()
+        self.nav.setObjectName("nav")
+        self.nav.setFixedWidth(132)
+        self.nav.setIconSize(QSize(16, 16))
+        self.nav.setFocusPolicy(Qt.NoFocus)
+        body.addWidget(self.nav)
+        self.pages = QStackedWidget()
+        body.addWidget(self.pages, 1)
+        v.addLayout(body, 1)
 
+        scan_page = QWidget()
+        sv = QVBoxLayout(scan_page)
+        sv.setContentsMargins(0, 0, 0, 0)
+        sv.setSpacing(0)
+        sv.addWidget(self._build_header())
         split = QSplitter(Qt.Horizontal)
         split.setChildrenCollapsible(False)
         split.addWidget(self._build_table())
         split.addWidget(self._build_right())
         split.setSizes([int(self.width() * 0.63), int(self.width() * 0.37)])
-        v.addWidget(split, 1)
+        sv.addWidget(split, 1)
+        sv.addWidget(self._build_opbar())
 
-        v.addWidget(self._build_opbar())
+        # (key, 标题, 图标, 构建函数)。除第一页外都是首次打开时才建：
+        # 弹窗页一建就要枚举全部窗口，放到启动时会拖慢打开
+        self._page_defs = [
+            ("scan", "开机体检", QStyle.SP_BrowserReload, lambda: scan_page),
+            ("popup", "弹窗拦截", QStyle.SP_ComputerIcon, self._make_popup_page),
+            ("notify", "通知管理", QStyle.SP_MessageBoxInformation, lambda: NotifyPage(self)),
+            ("backup", "备份还原", QStyle.SP_DialogSaveButton, lambda: BackupPage(self)),
+        ]
+        self._page_built = {}
+        for key, title, icon, _mk in self._page_defs:
+            it = QListWidgetItem(self._ic(icon), title)
+            it.setData(Qt.UserRole, key)
+            self.nav.addItem(it)
+            self.pages.addWidget(QWidget())                 # 占位，首次进入时替换
+        self.nav.currentRowChanged.connect(self._on_nav)
+        self.nav.setCurrentRow(0)
 
         self.log_edit = QPlainTextEdit()
         self.log_edit.setReadOnly(True)
@@ -1591,6 +1866,80 @@ class MainWindow(QMainWindow):
         self.btn_log.setCursor(Qt.PointingHandCursor)
         self.btn_log.clicked.connect(self.on_toggle_log)
         sb.addPermanentWidget(self.btn_log)
+
+    # ---------------- 分页 ----------------
+    def _page_index(self, key):
+        for i, d in enumerate(self._page_defs):
+            if d[0] == key:
+                return i
+        return -1
+
+    def page_widget(self, key, build=True):
+        """取某一页的控件；build=True 时没建过就现在建。"""
+        i = self._page_index(key)
+        if i < 0:
+            return None
+        if key not in self._page_built and build:
+            w = self._page_defs[i][3]()
+            old = self.pages.widget(i)
+            self.pages.insertWidget(i, w)
+            self.pages.removeWidget(old)
+            old.deleteLater()
+            self._page_built[key] = w
+        return self._page_built.get(key)
+
+    def show_page(self, key):
+        i = self._page_index(key)
+        if i >= 0:
+            self.nav.setCurrentRow(i)          # 触发 _on_nav
+
+    def current_page(self):
+        it = self.nav.currentItem()
+        return it.data(Qt.UserRole) if it else "scan"
+
+    @guard
+    def _on_nav(self, row):
+        if row < 0:
+            return
+        key = self._page_defs[row][0]
+        self.page_widget(key)
+        self.pages.setCurrentIndex(row)
+        # 搜索 / 分类过滤 / 延迟时长只对「开机体检」页有意义，别的页藏起来，免得以为能筛别的页
+        for act in getattr(self, "_scan_only_acts", []):
+            act.setVisible(key == "scan")
+        self._sync_nav_badges()
+
+    def _make_popup_page(self):
+        dlg = PopupDialog(self)
+        dlg.setWindowFlags(Qt.Widget)          # 对话框当普通控件嵌进来
+        return dlg
+
+    def _sync_nav_badges(self):
+        """导航项后面挂一句状态：分数 / 守护是否在跑 / 有几个流氓软件还在发通知 / 备份数。"""
+        if not hasattr(self, "nav") or not hasattr(self, "_page_defs"):
+            return
+        texts = {"scan": "开机体检", "popup": "弹窗拦截", "notify": "通知管理", "backup": "备份还原"}
+        if self.result and self.result.get("score") is not None:
+            texts["scan"] += "　%s" % self.result.get("score")
+        try:
+            texts["popup"] += "　%s" % ("守护中" if bc.guard_running() else "未开")
+        except Exception:
+            pass
+        npage = self._page_built.get("notify")
+        if npage is not None:
+            n = npage.stats().get("adware_on", 0)
+            if n:
+                texts["notify"] += "　%d" % n
+        try:
+            nb = len(bc.list_backups())
+            if nb:
+                texts["backup"] += "　%d" % nb
+        except Exception:
+            pass
+        for i, d in enumerate(self._page_defs):
+            it = self.nav.item(i)
+            if it and it.text() != texts[d[0]]:
+                it.setText(texts[d[0]])
 
     @staticmethod
     def _cap_pix(kind, color, size=13):
@@ -1800,6 +2149,10 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self._act("查找…", self.focus_search, "Ctrl+F"))
 
         m_view = mb.addMenu("视图(&V)")
+        for _n, (_k, _t) in enumerate((("scan", "开机体检"), ("popup", "弹窗拦截"),
+                                       ("notify", "通知管理"), ("backup", "备份还原")), 1):
+            m_view.addAction(self._act(_t, lambda _k=_k: self.show_page(_k), "Ctrl+%d" % _n))
+        m_view.addSeparator()
         m_view.addAction(self._act("展开全部", lambda: self.tree.expandAll()))
         m_view.addAction(self._act("收起全部", lambda: self.tree.collapseAll()))
         m_view.addSeparator()
@@ -1825,6 +2178,7 @@ class MainWindow(QMainWindow):
                                  QStyle.SP_MessageBoxQuestion))
         m_op.addSeparator()
         m_op.addAction(self._act("还原备份…", self.on_restore))
+        m_op.addAction(self._act("通知管理…", lambda: self.show_page("notify")))
         m_op.addAction(self._act("查看备份目录", self.open_backup_dir))
 
         m_help = mb.addMenu("帮助(&H)")
@@ -1859,14 +2213,14 @@ class MainWindow(QMainWindow):
         tb.addWidget(self.btn_ai)
         self._refresh_ai_button()
 
-        tb.addSeparator()
+        self._scan_only_acts = [tb.addSeparator()]
 
         self.ed_search = QLineEdit()
         self.ed_search.setPlaceholderText("搜索项目 / 应用 / 发布者 …")
         self.ed_search.setClearButtonEnabled(True)
         self.ed_search.setFixedWidth(190)
         self.ed_search.textChanged.connect(lambda _t: self._apply_view())
-        tb.addWidget(self.ed_search)
+        self._scan_only_acts.append(tb.addWidget(self.ed_search))
 
         self.cb_cat = QComboBox()
         self.cb_cat.setFixedWidth(104)
@@ -1875,22 +2229,22 @@ class MainWindow(QMainWindow):
         for c in bc.CAT_ORDER:
             self.cb_cat.addItem(c, c)
         self.cb_cat.currentIndexChanged.connect(lambda _i: self._apply_view())
-        tb.addWidget(self.cb_cat)
+        self._scan_only_acts.append(tb.addWidget(self.cb_cat))
 
         self.chk_third = QCheckBox("只看第三方")
         self.chk_third.setToolTip("隐藏微软 / Windows 自带组件")
         self.chk_third.stateChanged.connect(lambda _s: self._apply_view())
-        tb.addWidget(self.chk_third)
+        self._scan_only_acts.append(tb.addWidget(self.chk_third))
 
         self.lbl_count = QLabel("")
         self.lbl_count.setObjectName("hint")
-        tb.addWidget(self.lbl_count)
+        self._scan_only_acts.append(tb.addWidget(self.lbl_count))
 
-        tb.addSeparator()
+        self._scan_only_acts.append(tb.addSeparator())
 
         lbl_delay = QLabel("延迟")
         lbl_delay.setObjectName("meta")
-        tb.addWidget(lbl_delay)
+        self._scan_only_acts.append(tb.addWidget(lbl_delay))
         self.cb_delay = QComboBox()
         for sec, label in bc.DELAY_CHOICES:
             self.cb_delay.addItem(label, sec)
@@ -1899,7 +2253,7 @@ class MainWindow(QMainWindow):
         self.cb_delay.setFixedWidth(84)
         self.cb_delay.setToolTip("「延迟启动」使用多久：新建延迟任务或修改已有任务时生效")
         self.cb_delay.currentIndexChanged.connect(self.on_delay_changed)
-        tb.addWidget(self.cb_delay)
+        self._scan_only_acts.append(tb.addWidget(self.cb_delay))
 
         tb.addSeparator()
 
@@ -2455,6 +2809,7 @@ class MainWindow(QMainWindow):
         parts.append("自动服务 %s" % met.get("svc_auto"))
         self.lbl_meta.setText("　·　".join(str(x) for x in parts))
         self._log("体检完成：%s" % res.get("summary", ""))
+        self._sync_nav_badges()
         for f in res.get("findings", []):
             self._log("  [%s] %s" % (bc.SEV_CN.get(f["sev"], "?"), f["title"]))
 
@@ -3514,10 +3869,9 @@ class MainWindow(QMainWindow):
 
     @guard
     def on_popup_dialog(self):
-        """弹窗定位 + 拦截规则 + 后台守护开关。"""
-        dlg = PopupDialog(self)
-        self._popup_dlg = dlg
-        dlg.exec_()
+        """弹窗定位 + 拦截规则 + 后台守护开关（现在是左侧的一页）。"""
+        self.show_page("popup")
+        self._popup_dlg = self.page_widget("popup")
 
     @guard
     def on_update_db(self):
@@ -3775,6 +4129,7 @@ class MainWindow(QMainWindow):
             self.btn_restore.setEnabled(has)
         if hasattr(self, "lbl_bk"):
             self._refresh_backup_badge()
+        self._sync_nav_badges()
 
     @guard
     def open_backup_dir(self):
@@ -3786,36 +4141,15 @@ class MainWindow(QMainWindow):
 
     @guard
     def on_restore(self):
-        backups = bc.list_backups()
-        if not backups:
+        """还原入口统一到「备份还原」页：能看到每个备份改了什么再决定。"""
+        if not bc.list_backups():
             QMessageBox.information(self, "还原", "还没有任何备份。")
             return
-        dlg = QDialog(self)
-        dlg.setWindowTitle("选择要还原的备份")
-        dlg.resize(560, 380)
-        v = QVBoxLayout(dlg)
-        v.setContentsMargins(14, 12, 14, 12)
-        v.addWidget(QLabel("选择一个备份，还原到执行修复之前的状态："))
-        lw = QListWidget()
-        for b in backups:
-            it = QListWidgetItem("%s   （%s，共 %d 项）" % (b["created"], b["name"], b["count"]))
-            it.setData(Qt.UserRole, b["dir"])
-            lw.addItem(it)
-        lw.setCurrentRow(0)
-        v.addWidget(lw, 1)
-        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.button(QDialogButtonBox.Ok).setText("还 原")
-        bb.button(QDialogButtonBox.Ok).setObjectName("primary")
-        bb.button(QDialogButtonBox.Cancel).setText("取消")
-        bb.accepted.connect(dlg.accept)
-        bb.rejected.connect(dlg.reject)
-        v.addWidget(bb)
-        if dlg.exec_() != QDialog.Accepted:
+        self.show_page("backup")
+
+    def restore_dir(self, bdir):
+        if not bdir:
             return
-        cur = lw.currentItem()
-        if not cur:
-            return
-        bdir = cur.data(Qt.UserRole)
         if QMessageBox.question(self, "确认还原",
                                 "确定要还原所选备份吗？\n%s" % bdir,
                                 QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
@@ -3837,6 +4171,9 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "还原", msg)
         for r in results:
             self._log("[还原%s] %s" % ("成功" if r.get("ok") else "失败", r.get("kind", "")))
+        bp = self._page_built.get("backup")
+        if bp is not None:
+            bp.refresh()
         self.start_scan()
 
     @guard
