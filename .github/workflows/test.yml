@@ -15,14 +15,14 @@ jobs:
       PYTHONIOENCODING: utf-8
       PYTHONUTF8: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.10"
       - name: 安装依赖
         run: pip install -r requirements.txt
       - name: 离屏自测
-        run: python _test_boot.py
+        run: python .github/ci_annotate.py tests python _test_boot.py
       - name: 体检分段计时
         if: always()
-        run: python _prof_detail.py
+        run: python .github/ci_annotate.py profile python _prof_detail.py
