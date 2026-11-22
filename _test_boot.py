@@ -1541,9 +1541,9 @@ class TestLauncher(unittest.TestCase):
         src = os.path.join(BASE, "启动体检.bat")
         with open(src, "rb") as fp:
             data = fp.read()
-        lines = data.split(b"\n")
-        probe = [ln for ln in lines if not ln.lstrip().lower().startswith(b"start ")]
-        probe.insert(len(probe) - 1, b'echo PY=[%PY%]')
+        # 把真正启动程序的那一行换成 echo，其余原样执行
+        probe = [b"echo PY=[%PY%]" if ln.lstrip().lower().startswith(b"start ") else ln
+                 for ln in data.split(b"\n")]
         with tempfile.TemporaryDirectory() as td:
             bat = os.path.join(td, "probe.bat")
             with open(bat, "wb") as fp:
