@@ -2390,7 +2390,21 @@ class TestGuardE2E(unittest.TestCase):
         finally:
             if cls._qpa is not None:
                 os.environ["QT_QPA_PLATFORM"] = cls._qpa
-        assert ok, "守护没起来：%s\n%s" % (msg, cls.log())
+        if not ok:
+            # 启动失败：前台跑一遍，把崩溃信息捞出来（正常启动时 stderr 是丢掉的）
+            import subprocess
+            env = dict(os.environ)
+            env.pop("QT_QPA_PLATFORM", None)
+            try:
+                r = subprocess.run([sys.executable, bc.GUARD_SCRIPT, "--silent"], env=env, cwd=bc.BASE_DIR,
+                                   capture_output=True, timeout=8)
+                diag = "rc=%s\nstdout=%s\nstderr=%s" % (
+                    r.returncode, r.stdout.decode("utf-8", "replace")[-1500:],
+                    r.stderr.decode("utf-8", "replace")[-2500:])
+            except subprocess.TimeoutExpired as e:
+                diag = "8 秒内没退出（说明能启动，只是 pid 没写出来）\nstderr=%s" % (
+                    (e.stderr or b"").decode("utf-8", "replace")[-2500:])
+            assert False, "守护没起来：%s\n日志：%s\n前台诊断：%s" % (msg, cls.log(), diag)
         for _ in range(100):                                       # 等它把「启动」写进日志
             if "守护启动" in cls.log():
                 break
