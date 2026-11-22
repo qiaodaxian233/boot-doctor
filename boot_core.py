@@ -672,7 +672,7 @@ def diff_snapshot(old, new):
 # 卸载交给系统自身的 uninstall 注册表项，这里只把卸载命令找出来。
 # --------------------------------------------------------------------------
 
-ADWARE_DB_PATH = os.path.join(BASE_DIR, "adware_db.json")
+ADWARE_DB_PATH = os.environ.get("BOOTDOC_ADWARE_DB") or os.path.join(BASE_DIR, "adware_db.json")
 _ADB = {}
 
 
@@ -1759,6 +1759,9 @@ DEFAULT_POPUP_RULES = {
     "auto_adware": True,      # 自动关闭命中流氓软件特征库的弹窗
     "poll_ms": 1200,
     "watch_autostart": True,  # 守护顺带盯开机自启的新增 / 重新启用 / 命令被改
+    "watch_process": True,    # 守护顺带盯新启动的程序：命中特征库 / 冒充微软时提醒
+    "auto_kill_adware": False,  # 命中特征库的新进程自动结束（默认关：结束进程是有破坏性的操作）
+    "watch_strict": False,    # 严格模式：未签名且从 Temp / AppData 启动的也提醒
     "block": [],              # [{"kind": "proc|path|title|class", "pattern": "...", "note": ""}]
     "allow": [],
 }
@@ -1771,7 +1774,8 @@ def load_popup_rules(path=None):
         with open(p, "r", encoding="utf-8") as fp:
             raw = json.load(fp)
         if isinstance(raw, dict):
-            for k in ("enabled", "auto_adware", "poll_ms", "watch_autostart"):
+            for k in ("enabled", "auto_adware", "poll_ms", "watch_autostart",
+                      "watch_process", "auto_kill_adware", "watch_strict"):
                 if k in raw:
                     d[k] = raw[k]
             for k in ("block", "allow"):
@@ -3330,6 +3334,87 @@ def enum_processes():
     finally:
         k32.CloseHandle(snap)
     return out
+
+
+PROC_WATCH_LOG = os.path.join(LOG_DIR, "process_watch.log")
+PROC_LEVEL_CN = {"adware": "命中特征库", "spoof": "冒充微软", "unsigned": "未签名（严格模式）"}
+
+
+def _in_user_dropzone(path):
+    """恶意 / 推广程序最爱待的位置：Temp、AppData、ProgramData、Public（不含 Downloads：用户自己下的程序太多）。"""
+    p = (path or "").lower().replace("/", "\\")
+    pd = (os.environ.get("ProgramData") or r"C:\ProgramData").lower().rstrip("\\") + "\\"
+    pub = (os.environ.get("PUBLIC") or r"C:\Users\Public").lower().rstrip("\\") + "\\"
+    return ("\\appdata\\" in p or "\\temp\\" in p or "\\tmp\\" in p
+            or p.startswith(pd) or p.startswith(pub))
+
+
+def judge_new_process(p, strict=False):
+    """判断一个新启动的进程要不要提醒。返回 {level, sev, label, why, ...}，没问题返回 None。
+
+    默认只报高把握的两类，避免天天弹提醒：
+      adware  命中流氓软件特征库（目录名 / 签名主体 / 家族规则，含签名核实）
+      spoof   公司名写 Microsoft、签名却不是微软
+    strict=True 再加一类：没有任何签名、且从 Temp / AppData / ProgramData 启动的
+    （很多安装程序会把自己解压到 Temp 运行，所以默认关）。
+    """
+    path, name = p.get("path") or "", p.get("name") or os.path.basename(p.get("path") or "")
+    if not path or _under_system_dir(path):
+        return None
+    base = {"pid": p.get("pid"), "ctime": p.get("ctime") or 0, "name": name, "path": path,
+            "company": p.get("company") or ""}
+    r = adware_check(path=path, name=name, company=p.get("company") or "", cmd=path)
+    if r.get("hit"):
+        return dict(base, level="adware", sev=r.get("sev", "mid"), label=r.get("label", ""),
+                    why=r.get("why", ""), family=r.get("family", ""), spoof=bool(r.get("spoof")))
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    app = {"path": path, "exists": True, "size": int(st.st_size), "mtime": int(st.st_mtime),
+           "company": p.get("company") or ""}
+    v = ms_spoof_verdict(app)
+    if v:
+        return dict(base, level="spoof", sev=v[0], label="疑似冒充微软", why=v[1], family="")
+    if strict and _in_user_dropzone(path) and app_signature(app).get("state") == "unsigned":
+        return dict(base, level="unsigned", sev="low", label="未签名程序",
+                    why="没有任何数字签名，且从 Temp / AppData / ProgramData 一类位置启动", family="")
+    return None
+
+
+def append_proc_watch(rows, path=None):
+    if not rows:
+        return
+    p = path or PROC_WATCH_LOG
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "a", encoding="utf-8") as fp:
+            for r in rows:
+                fp.write(json.dumps(r, ensure_ascii=False) + "\n")
+        if os.path.getsize(p) > 512 * 1024:
+            with open(p, "r", encoding="utf-8", errors="replace") as fp:
+                lines = fp.readlines()[-800:]
+            with open(p, "w", encoding="utf-8") as fp:
+                fp.writelines(lines)
+    except Exception as e:
+        log_line("append proc watch failed: %r" % (e,))
+
+
+def proc_watch_log(limit=200, path=None):
+    """新进程提醒记录，最新在前。"""
+    out = []
+    try:
+        with open(path or PROC_WATCH_LOG, "r", encoding="utf-8", errors="replace") as fp:
+            for line in fp:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except Exception:
+                        pass
+    except Exception:
+        return []
+    return out[-int(limit):][::-1]
 
 
 def proc_kill_allowed(name, path, pid=0):
@@ -5380,8 +5465,19 @@ def _remove_delay_task(task_name, dry_run=False):
     return False, "删除任务失败：%s（可能已不存在）" % task_name
 
 
-def _ms_spoof_findings(F, add):
-    """公司名写着 Microsoft、数字签名却不是微软的文件：给一条体检项。
+_PROTECTED_ROOTS_CACHE = []
+
+
+def _protected_roots():
+    if not _PROTECTED_ROOTS_CACHE:
+        _PROTECTED_ROOTS_CACHE.append(tuple(x.lower().rstrip("\\") + "\\" for x in (
+            os.environ.get("SystemRoot", r"C:\Windows"), os.environ.get("ProgramFiles", ""),
+            os.environ.get("ProgramFiles(x86)", ""), os.environ.get("ProgramW6432", "")) if x))
+    return _PROTECTED_ROOTS_CACHE[0]
+
+
+def ms_spoof_verdict(app):
+    """公司名写着 Microsoft、数字签名却不是微软：返回 (sev, 说明)，没问题返回 None。
 
     只在证据确凿时报，宁可漏报也不吓用户：
       · 签名校验通过，但签名者是别人（名字不以 Microsoft 开头）  → 高危
@@ -5391,6 +5487,22 @@ def _ms_spoof_findings(F, add):
     系统目录里的文件不查「没签名」：老系统文件的目录签名有可能漏查，那里有系统文件保护，
     被替换要先拿到最高权限。
     """
+    path = (app or {}).get("path") or ""
+    if not path or not app.get("exists") or "microsoft" not in (app.get("company") or "").lower():
+        return None
+    sig = app_signature(app)
+    st, signer = sig.get("state"), (sig.get("signer") or "")
+    if st == "valid" and signer and not _ms_ish(signer):
+        return "high", "数字签名校验通过，但签名者是「%s」，不是微软" % signer
+    if st == "invalid" and sig.get("rc") in (_TRUST_E_BAD_DIGEST, _TRUST_E_EXPLICIT_DISTRUST):
+        return "high", "数字签名无效：%s" % (sig.get("detail") or "").split("\n")[0]
+    if st == "unsigned" and not path.lower().replace("/", "\\").startswith(_protected_roots()):
+        return "mid", "文件没有任何数字签名，而且放在系统目录和 Program Files 之外"
+    return None
+
+
+def _ms_spoof_findings(F, add):
+    """公司名写着 Microsoft、数字签名却不是微软的文件：给一条体检项（判定见 ms_spoof_verdict）。"""
     cands = {}
     for f in F:
         a = f.get("app") or {}
@@ -5399,21 +5511,11 @@ def _ms_spoof_findings(F, add):
     if not cands:
         return
     warm_signatures(list(cands.values()))
-    roots = tuple(x.lower().rstrip("\\") + "\\" for x in (
-        os.environ.get("SystemRoot", r"C:\Windows"), os.environ.get("ProgramFiles", ""),
-        os.environ.get("ProgramFiles(x86)", ""), os.environ.get("ProgramW6432", "")) if x)
     for key, a in cands.items():
-        sig = app_signature(a)
-        st, signer = sig.get("state"), (sig.get("signer") or "")
-        sev = why = ""
-        if st == "valid" and signer and not _ms_ish(signer):
-            sev, why = "high", "数字签名校验通过，但签名者是「%s」，不是微软" % signer
-        elif st == "invalid" and sig.get("rc") in (_TRUST_E_BAD_DIGEST, _TRUST_E_EXPLICIT_DISTRUST):
-            sev, why = "high", "数字签名无效：%s" % (sig.get("detail") or "").split("\n")[0]
-        elif st == "unsigned" and not key.replace("/", "\\").startswith(roots):
-            sev, why = "mid", "文件没有任何数字签名，而且放在系统目录和 Program Files 之外"
-        if not sev:
+        v = ms_spoof_verdict(a)
+        if not v:
             continue
+        sev, why = v
         name = a.get("desc") or os.path.basename(a["path"])
         add(id="ms_spoof@" + key, cat="流氓软件", sev=sev, name=name, src="冒充微软",
             title="疑似冒充微软组件：%s" % name,

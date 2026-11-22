@@ -1173,10 +1173,53 @@ class PopupDialog(QDialog):
         av.addLayout(ab)
         av.addWidget(self.as_tree, 1)
 
+        # ---- 新进程：监控开关 + 提醒记录 ----
+        pr = bc.load_popup_rules()
+        self.pw_tree = QTreeWidget()
+        self.pw_tree.setColumnCount(6)
+        self.pw_tree.setHeaderLabels(["时间", "判定", "程序", "原因", "路径", "处理"])
+        self.pw_tree.setRootIsDecorated(False)
+        self.pw_tree.setAlternatingRowColors(True)
+        self.pw_tree.setUniformRowHeights(True)
+        ph = self.pw_tree.header()
+        for c in (0, 1, 5):
+            ph.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        for c in (2, 3):
+            ph.setSectionResizeMode(c, QHeaderView.Interactive)
+        ph.setSectionResizeMode(4, QHeaderView.Stretch)
+        self.pw_tree.setColumnWidth(2, 170)
+        self.pw_tree.setColumnWidth(3, 300)
+        pw_box = QWidget()
+        pv = QVBoxLayout(pw_box)
+        pv.setContentsMargins(0, 6, 0, 0)
+        pv.setSpacing(6)
+        self.chk_watch_proc = QCheckBox("监控新启动的程序：命中流氓软件特征库 / 冒充微软时，托盘立即提醒")
+        self.chk_watch_proc.setChecked(bool(pr.get("watch_process", True)))
+        self.chk_watch_proc.toggled.connect(lambda on: self.on_proc_opt("watch_process", on))
+        pv.addWidget(self.chk_watch_proc)
+        self.chk_autokill = QCheckBox("命中特征库的新进程自动结束（谨慎：无法还原，特征库偶尔有误报）")
+        self.chk_autokill.setChecked(bool(pr.get("auto_kill_adware", False)))
+        self.chk_autokill.toggled.connect(lambda on: self.on_proc_opt("auto_kill_adware", on))
+        pv.addWidget(self.chk_autokill)
+        self.chk_strict = QCheckBox("严格模式：没有数字签名、且从 Temp / AppData / ProgramData 启动的程序也提醒"
+                                    "（很多安装程序会解压到 Temp 运行，所以默认关）")
+        self.chk_strict.setChecked(bool(pr.get("watch_strict", False)))
+        self.chk_strict.toggled.connect(lambda on: self.on_proc_opt("watch_strict", on))
+        pv.addWidget(self.chk_strict)
+        pb = QHBoxLayout()
+        pb.addStretch(1)
+        self.btn_pw_vt = QPushButton("查 VirusTotal")
+        self.btn_pw_vt.setToolTip("在浏览器里打开选中程序的 VirusTotal 报告页（只发送 SHA-256，不上传文件）")
+        self.btn_pw_vt.clicked.connect(self.on_pw_virustotal)
+        pb.addWidget(self.btn_pw_vt)
+        pv.addLayout(pb)
+        pv.addWidget(self.pw_tree, 1)
+
         self.tabs = QTabWidget()
         self.tabs.addTab(self.tree, "当前窗口")
         self.tabs.addTab(self.watch, "窗口记录")
         self.tabs.addTab(as_box, "自启变动")
+        self.tabs.addTab(pw_box, "新进程")
         self.tabs.currentChanged.connect(self._on_tab)
         v.addWidget(self.tabs, 1)
 
@@ -1350,6 +1393,52 @@ class PopupDialog(QDialog):
             self._fill_watch()
         elif i == 2:
             self._fill_autostart()
+        elif i == 3:
+            self._fill_procwatch()
+
+    def _fill_procwatch(self):
+        rows = bc.proc_watch_log(200)
+        self.pw_tree.clear()
+        for r in rows:
+            ti = QTreeWidgetItem([r.get("t", ""), bc.PROC_LEVEL_CN.get(r.get("level"), r.get("level") or ""),
+                                  r.get("name") or "", r.get("why") or "", r.get("path") or "",
+                                  r.get("action") or ""])
+            ti.setData(0, Qt.UserRole, r)
+            ti.setToolTip(3, r.get("why") or "")
+            ti.setToolTip(4, r.get("path") or "")
+            if r.get("sev") == "high" or r.get("action") == "已结束":
+                ti.setForeground(1, QBrush(QColor(sev_color("high"))))
+            elif r.get("sev") == "mid":
+                ti.setForeground(1, QBrush(QColor(sev_color("mid"))))
+            self.pw_tree.addTopLevelItem(ti)
+        self.tabs.setTabText(3, "新进程(%d)" % len(rows) if rows else "新进程")
+        self.btn_pw_vt.setEnabled(bool(rows))
+
+    @guard
+    def on_proc_opt(self, key, on):
+        if key == "auto_kill_adware" and on:
+            if QMessageBox.question(
+                    self, "自动结束流氓软件进程",
+                    "开启后，守护发现命中特征库的新程序会**直接结束它**，无法还原。\n\n"
+                    "· 特征库偶尔有误报：结束前会核对进程身份，系统进程和本程序自己永远不碰，但正常软件被误判时也会被结束\n"
+                    "· 只结束当前进程；它的自启项 / 服务还在的话，下次还会起来\n\n确定开启吗？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                self.chk_autokill.blockSignals(True)
+                self.chk_autokill.setChecked(False)
+                self.chk_autokill.blockSignals(False)
+                return
+        r = bc.load_popup_rules()
+        r[key] = bool(on)
+        bc.save_popup_rules(r)                   # 守护每次规则文件变了就重读，立即生效，不用重启
+
+    @guard
+    def on_pw_virustotal(self):
+        ti = self.pw_tree.currentItem()
+        r = (ti.data(0, Qt.UserRole) if ti else None) or {}
+        if r.get("path"):
+            sha = open_virustotal(self, r["path"])
+            if sha:
+                self.log.appendPlainText("已在浏览器打开 VirusTotal（只发送了哈希 %s…）：%s" % (sha[:12], r.get("name") or ""))
 
     def _fill_autostart(self):
         """守护记下的开机自启变化（新增 / 被重新启用 / 命令被改），最新在前。"""
