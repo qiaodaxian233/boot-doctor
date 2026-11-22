@@ -1117,10 +1117,44 @@ class PopupDialog(QDialog):
         self.watch.setColumnWidth(3, 160)
         self.watch.itemDoubleClicked.connect(lambda *_: self.on_block_watch())
 
+        self.as_tree = QTreeWidget()
+        self.as_tree.setColumnCount(6)
+        self.as_tree.setHeaderLabels(["时间", "变化", "名称", "来源", "命令", "判定"])
+        self.as_tree.setRootIsDecorated(False)
+        self.as_tree.setAlternatingRowColors(True)
+        self.as_tree.setUniformRowHeights(True)
+        ah = self.as_tree.header()
+        for c in (0, 1):
+            ah.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        for c in (2, 3, 5):
+            ah.setSectionResizeMode(c, QHeaderView.Interactive)
+        ah.setSectionResizeMode(4, QHeaderView.Stretch)
+        self.as_tree.setColumnWidth(2, 200)
+        self.as_tree.setColumnWidth(3, 150)
+        self.as_tree.setColumnWidth(5, 140)
+        self.as_tree.itemDoubleClicked.connect(lambda *_: self.on_handle_autostart())
+        as_box = QWidget()
+        av = QVBoxLayout(as_box)
+        av.setContentsMargins(0, 6, 0, 0)
+        av.setSpacing(6)
+        ab = QHBoxLayout()
+        self.chk_watch_as = QCheckBox("守护运行时监控开机自启（新增 / 被重新启用 / 命令被改，立即在托盘提醒）")
+        self.chk_watch_as.setChecked(bool(bc.load_popup_rules().get("watch_autostart", True)))
+        self.chk_watch_as.toggled.connect(self.on_toggle_watch_autostart)
+        ab.addWidget(self.chk_watch_as)
+        ab.addStretch(1)
+        self.btn_as_handle = QPushButton("到体检里处理")
+        self.btn_as_handle.setToolTip("跳到「开机体检」页并定位到这一项，在那里禁止 / 延迟 / 删除")
+        self.btn_as_handle.clicked.connect(self.on_handle_autostart)
+        ab.addWidget(self.btn_as_handle)
+        av.addLayout(ab)
+        av.addWidget(self.as_tree, 1)
+
         self.tabs = QTabWidget()
         self.tabs.addTab(self.tree, "当前窗口")
         self.tabs.addTab(self.watch, "窗口记录")
-        self.tabs.currentChanged.connect(lambda i: self._fill_watch() if i == 1 else None)
+        self.tabs.addTab(as_box, "自启变动")
+        self.tabs.currentChanged.connect(self._on_tab)
         v.addWidget(self.tabs, 1)
 
         self.lbl_guard = QLabel("")
@@ -1287,6 +1321,55 @@ class PopupDialog(QDialog):
             self.tabs.setTabText(1, "窗口记录")
         else:
             self.tabs.setTabText(1, "窗口记录(%d)" % len(rows))
+
+    def _on_tab(self, i):
+        if i == 1:
+            self._fill_watch()
+        elif i == 2:
+            self._fill_autostart()
+
+    def _fill_autostart(self):
+        """守护记下的开机自启变化（新增 / 被重新启用 / 命令被改），最新在前。"""
+        rows = bc.autostart_watch_log(200)
+        self.as_tree.clear()
+        for r in rows:
+            ti = QTreeWidgetItem([
+                r.get("t", ""), bc.AUTOSTART_CHANGE_CN.get(r.get("change"), r.get("change") or ""),
+                r.get("name") or "", r.get("source") or "", r.get("cmd") or "",
+                ("流氓软件：%s" % r["adware"]) if r.get("adware") else "",
+            ])
+            ti.setData(0, Qt.UserRole, r)
+            ti.setToolTip(4, (r.get("cmd") or "") + (
+                "\n原命令：%s" % r["old_cmd"] if r.get("old_cmd") else ""))
+            if r.get("adware"):
+                ti.setForeground(5, QBrush(QColor(sev_color("high"))))
+            if r.get("change") in ("reenabled", "changed"):
+                ti.setForeground(1, QBrush(QColor(sev_color("mid"))))
+            self.as_tree.addTopLevelItem(ti)
+        self.tabs.setTabText(2, "自启变动(%d)" % len(rows) if rows else "自启变动")
+        self.btn_as_handle.setEnabled(bool(rows))
+
+    @guard
+    def on_toggle_watch_autostart(self, on):
+        r = bc.load_popup_rules()
+        r["watch_autostart"] = bool(on)
+        bc.save_popup_rules(r)
+        if bc.guard_running():
+            QMessageBox.information(self, "开机自启监控",
+                                    "已%s。重启一次后台守护后生效。" % ("开启" if on else "关闭"))
+
+    @guard
+    def on_handle_autostart(self):
+        ti = self.as_tree.currentItem()
+        if not ti:
+            return
+        r = ti.data(0, Qt.UserRole) or {}
+        w = self.window()
+        if hasattr(w, "show_page") and hasattr(w, "ed_search"):
+            w.show_page("scan")
+            w.ed_search.setText(r.get("name") or "")
+            if not (w.scan_worker and w.scan_worker.isRunning()):
+                w.start_scan()             # 新加的自启，旧的体检结果里还没有
 
     def on_block_watch(self):
         ti = self.watch.currentItem()
@@ -1802,7 +1885,7 @@ class MainWindow(QMainWindow):
         body.setSpacing(0)
         self.nav = QListWidget()
         self.nav.setObjectName("nav")
-        self.nav.setFixedWidth(132)
+        self.nav.setFixedWidth(158)        # 放得下「开机体检　100」「弹窗拦截　守护中」
         self.nav.setIconSize(QSize(16, 16))
         self.nav.setFocusPolicy(Qt.NoFocus)
         self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -1829,7 +1912,7 @@ class MainWindow(QMainWindow):
         # 弹窗页一建就要枚举全部窗口，放到启动时会拖慢打开
         self._page_defs = [
             ("scan", "开机体检", QStyle.SP_BrowserReload, lambda: scan_page),
-            ("popup", "弹窗拦截", QStyle.SP_ComputerIcon, self._make_popup_page),
+            ("popup", "实时防护", QStyle.SP_ComputerIcon, self._make_popup_page),
             ("notify", "通知管理", QStyle.SP_MessageBoxInformation, lambda: NotifyPage(self)),
             ("backup", "备份还原", QStyle.SP_DialogSaveButton, lambda: BackupPage(self)),
         ]
@@ -1920,7 +2003,7 @@ class MainWindow(QMainWindow):
         """导航项后面挂一句状态：分数 / 守护是否在跑 / 有几个流氓软件还在发通知 / 备份数。"""
         if not hasattr(self, "nav") or not hasattr(self, "_page_defs"):
             return
-        texts = {"scan": "开机体检", "popup": "弹窗拦截", "notify": "通知管理", "backup": "备份还原"}
+        texts = {"scan": "开机体检", "popup": "实时防护", "notify": "通知管理", "backup": "备份还原"}
         if self.result and self.result.get("score") is not None:
             texts["scan"] += "　%s" % self.result.get("score")
         try:
@@ -2151,7 +2234,7 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self._act("查找…", self.focus_search, "Ctrl+F"))
 
         m_view = mb.addMenu("视图(&V)")
-        for _n, (_k, _t) in enumerate((("scan", "开机体检"), ("popup", "弹窗拦截"),
+        for _n, (_k, _t) in enumerate((("scan", "开机体检"), ("popup", "实时防护"),
                                        ("notify", "通知管理"), ("backup", "备份还原")), 1):
             m_view.addAction(self._act(_t, lambda _k=_k: self.show_page(_k), "Ctrl+%d" % _n))
         m_view.addSeparator()
@@ -3834,6 +3917,9 @@ class MainWindow(QMainWindow):
         self._tree_palette()
         self._cap_icons()
         self._update_admin_badge()
+        np_ = self._page_built.get("notify")
+        if np_ is not None:
+            np_._fill()                    # 行文字颜色是按主题写死的，换主题要重填
 
     def _ai_targets(self):
         out = []
@@ -4322,6 +4408,9 @@ def main():
     app.installEventFilter(app._chrome_filter)
     win = MainWindow()
     win.show()
+    for a in sys.argv[1:]:
+        if a.startswith("--page="):           # 守护托盘提醒点进来时直接到对应页
+            win.show_page(a.split("=", 1)[1])
     sys.exit(app.exec_())
 
 

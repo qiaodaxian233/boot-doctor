@@ -1653,6 +1653,114 @@ class TestNavPages(unittest.TestCase):
                 bc.BACKUP_DIR = old
 
 
+class TestAutostartWatch(unittest.TestCase):
+    """新增自启监控。测试写的 Run 值指向一个不存在的路径：万一测试中途崩了没删掉，登录时也只是静默失败。"""
+    NAME = "BootDoctorUnitTestProbe"
+    CMD = r'"C:\BootDoctorUnitTest\not_exist.exe" --probe'
+    RUN = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+    def _set(self, cmd):
+        import winreg
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, self.RUN, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, self.NAME, 0, winreg.REG_SZ, cmd)
+
+    def tearDown(self):
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.RUN, 0, winreg.KEY_SET_VALUE) as k:
+                winreg.DeleteValue(k, self.NAME)
+        except OSError:
+            pass
+
+    def test_diff_logic(self):
+        old = {"a": {"name": "A", "cmd": "a.exe", "enabled": True, "kind": "run"},
+               "b": {"name": "B", "cmd": "b.exe", "enabled": False, "kind": "run"},
+               "c": {"name": "C", "cmd": "c.exe", "enabled": True, "kind": "run"}}
+        new = {"a": {"name": "A", "cmd": "a.exe", "enabled": True, "kind": "run"},
+               "b": {"name": "B", "cmd": "b.exe", "enabled": True, "kind": "run"},
+               "c": {"name": "C", "cmd": "evil.exe", "enabled": True, "kind": "run"},
+               "d": {"name": "D", "cmd": "d.exe", "enabled": True, "kind": "run"}}
+        got = {r["key"]: r["change"] for r in bc.autostart_diff(old, new)}
+        self.assertEqual(got, {"b": "reenabled", "c": "changed", "d": "added"})
+        self.assertEqual(bc.autostart_diff(new, old) and
+                         {r["key"] for r in bc.autostart_diff(new, old)}, {"c"},
+                         "删除不报，只报命令变化")
+
+    def test_own_entries_ignored(self):
+        self.assertTrue(bc._OWN_AUTOSTART.search("BootDoctorPopupGuard"))
+        self.assertTrue(bc._OWN_AUTOSTART.search(r"\BootDoctor-Delay-QQ"))
+        self.assertFalse(bc._OWN_AUTOSTART.search("BootDoctorPopupGuardX"))
+
+    def test_snapshot_and_diff_real_registry(self):
+        before = bc.autostart_snapshot(with_tasks=False)
+        self._set(self.CMD)
+        after = bc.autostart_snapshot(with_tasks=False)
+        rows = [r for r in bc.autostart_diff(before, after) if r["name"] == self.NAME]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["change"], "added")
+        self._set(self.CMD + " --changed")
+        again = bc.autostart_snapshot(with_tasks=False)
+        rows = [r for r in bc.autostart_diff(after, again) if r["name"] == self.NAME]
+        self.assertEqual([r["change"] for r in rows], ["changed"])
+
+    def test_watcher_wakes_on_registry_change(self):
+        import time as _t
+        w = bc.AutostartWatcher(watch_tasks=False)
+        self.assertTrue(w.start(), "一个位置都没盯上")
+        try:
+            self.assertTrue(any(x.endswith(self.RUN) for x in w.watching), w.watching)
+            self.assertEqual(w.dirty_at, 0.0)
+            self._set(self.CMD)
+            end = _t.time() + 5
+            while not w.dirty_at and _t.time() < end:
+                _t.sleep(0.05)
+            self.assertTrue(w.dirty_at, "写了 Run 键，监控线程 5 秒内没收到通知")
+            # 通知是一次性的：要能连续收到第二次
+            w.dirty_at = 0.0
+            self._set(self.CMD + " --again")
+            end = _t.time() + 5
+            while not w.dirty_at and _t.time() < end:
+                _t.sleep(0.05)
+            self.assertTrue(w.dirty_at, "第二次变化没收到：触发后没重新挂通知")
+        finally:
+            w.stop()
+
+    def test_describe_change(self):
+        np = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "notepad.exe")
+        r = bc.describe_autostart_change({"name": "x", "cmd": '"%s" a.txt' % np,
+                                          "kind": "run", "change": "added"})
+        self.assertEqual(os.path.normcase(r["path"]), os.path.normcase(np))
+        self.assertIn("Microsoft", r["company"])
+        self.assertEqual(r["adware"], "")
+        self.assertTrue(r["t"].startswith("20"))
+
+    def test_page_tab_and_jump(self):
+        from PyQt5.QtWidgets import QApplication
+        import boot_doctor as bd
+        app = QApplication.instance() or QApplication([])  # noqa: F841
+        old = bc.AUTOSTART_WATCH_LOG
+        with tempfile.TemporaryDirectory() as td:
+            bc.AUTOSTART_WATCH_LOG = os.path.join(td, "w.log")
+            bc.append_autostart_watch([{"t": "2026-11-22 10:00:00", "change": "added",
+                                        "name": "SomeUpdater", "source": "用户 Run",
+                                        "cmd": "x.exe", "adware": "2345 全家桶"}])
+            win = bd.MainWindow(autoscan=False)
+            win.start_scan = lambda: None                 # 别真去体检
+            try:
+                win.show_page("popup")
+                pg = win.page_widget("popup")
+                pg.tabs.setCurrentIndex(2)
+                self.assertEqual(pg.as_tree.topLevelItemCount(), 1)
+                self.assertIn("(1)", pg.tabs.tabText(2))
+                pg.as_tree.setCurrentItem(pg.as_tree.topLevelItem(0))
+                pg.on_handle_autostart()
+                self.assertEqual(win.current_page(), "scan")
+                self.assertEqual(win.ed_search.text(), "SomeUpdater")
+            finally:
+                win.close()
+                bc.AUTOSTART_WATCH_LOG = old
+
+
 class TestLauncher(unittest.TestCase):
     def test_bat_finds_python(self):
         """启动体检.bat 去掉了写死的路径兜底后，必须还能找到 pythonw（真跑一遍 bat 的查找逻辑）。"""

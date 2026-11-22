@@ -1690,6 +1690,7 @@ DEFAULT_POPUP_RULES = {
     "enabled": False,
     "auto_adware": True,      # 自动关闭命中流氓软件特征库的弹窗
     "poll_ms": 1200,
+    "watch_autostart": True,  # 守护顺带盯开机自启的新增 / 重新启用 / 命令被改
     "block": [],              # [{"kind": "proc|path|title|class", "pattern": "...", "note": ""}]
     "allow": [],
 }
@@ -1702,7 +1703,7 @@ def load_popup_rules(path=None):
         with open(p, "r", encoding="utf-8") as fp:
             raw = json.load(fp)
         if isinstance(raw, dict):
-            for k in ("enabled", "auto_adware", "poll_ms"):
+            for k in ("enabled", "auto_adware", "poll_ms", "watch_autostart"):
                 if k in raw:
                     d[k] = raw[k]
             for k in ("block", "allow"):
@@ -2129,6 +2130,253 @@ def popup_log_tail(n=40):
         return [x.rstrip() for x in lines[-int(n):]]
     except Exception:
         return []
+
+
+# --------------------------------------------------------------------------
+# 新增自启监控：有软件偷偷加开机启动 / 把你禁用的又打开 / 改了启动命令，马上知道。
+#
+# 不轮询：RegNotifyChangeKeyValue 盯 Run 系列键和 StartupApproved，
+# FindFirstChangeNotification 盯两个启动文件夹和 System32\Tasks。有变化才重新拍一次快照做对比。
+# 快照存在 _logs\autostart_baseline.json，守护没运行期间的变化下次启动时也能补报。
+# --------------------------------------------------------------------------
+AUTOSTART_BASELINE = os.path.join(LOG_DIR, "autostart_baseline.json")
+AUTOSTART_WATCH_LOG = os.path.join(LOG_DIR, "autostart_watch.log")
+_OWN_AUTOSTART = re.compile(r"(^|\\)(BootDoctorPopupGuard|BootDoctor-Delay-[^\\]*)$", re.I)
+AUTOSTART_CHANGE_CN = {"added": "新增", "reenabled": "被重新启用", "changed": "启动命令被修改"}
+
+
+def _task_command(task_path):
+    """计划任务「\\路径\\名称」→ 它要运行的命令行（读 XML，读不到返回 ''）。"""
+    try:
+        txt = _task_xml_text(os.path.join(TASKS_DIR, task_path.lstrip("\\")))
+    except OSError:
+        return ""
+    m_cmd = re.search(r"<Command>([^<]*)</Command>", txt)
+    m_arg = re.search(r"<Arguments>([^<]*)</Arguments>", txt)
+    cmd = (m_cmd.group(1) if m_cmd else "").strip()
+    if m_arg and m_arg.group(1).strip():
+        cmd += " " + m_arg.group(1).strip()
+    return cmd
+
+
+def autostart_snapshot(with_tasks=True):
+    """当前所有开机自启：{键: {name, cmd, source, kind, hive, enabled}}。本工具自己的条目不算。"""
+    snap = {}
+    for it in enum_startup_items():
+        name = it.get("name") or ""
+        if _OWN_AUTOSTART.search(name):
+            continue
+        key = "%s|%s|%s|%s" % (it.get("kind"), it.get("hive"), it.get("subkey") or it.get("source"), name)
+        snap[key] = {"name": name, "cmd": it.get("cmd") or "", "source": it.get("source") or "",
+                     "kind": it.get("kind") or "", "hive": it.get("hive") or "",
+                     "enabled": bool(it.get("enabled", True))}
+    if with_tasks:
+        try:
+            tasks = boot_logon_tasks_from_xml()
+        except OSError:
+            tasks = None                                # 普通权限读不了任务目录：这一类不比
+        for t in tasks or []:
+            if _OWN_AUTOSTART.search(t):
+                continue
+            snap["task|" + t] = {"name": t.rsplit("\\", 1)[-1], "cmd": t,
+                                 "source": "计划任务（开机/登录触发）", "kind": "task",
+                                 "hive": "", "enabled": True}
+    return snap
+
+
+def autostart_diff(old, new):
+    """对比两次快照，返回变化列表（每项带 change: added / reenabled / changed）。
+
+    「删除」不报：用户自己清理、软件卸载都会删，报出来只是噪音。
+    """
+    out = []
+    for k, v in (new or {}).items():
+        o = (old or {}).get(k)
+        if o is None:
+            ch = "added"
+        elif v.get("enabled") and not o.get("enabled"):
+            ch = "reenabled"
+        elif v.get("kind") != "task" and (o.get("cmd") or "") != (v.get("cmd") or ""):
+            ch = "changed"
+        else:
+            continue
+        row = dict(v, key=k, change=ch)
+        if ch == "changed":
+            row["old_cmd"] = o.get("cmd") or ""
+        out.append(row)
+    return out
+
+
+def describe_autostart_change(row):
+    """给变化补上「这是哪个程序 / 是不是流氓软件」，供提醒和记录用。"""
+    cmd = row.get("cmd") or ""
+    if row.get("kind") == "task" and cmd.startswith("\\"):
+        cmd = _task_command(cmd) or cmd
+    exe, _args = split_cmdline(cmd) if cmd else ("", "")
+    path = resolve_image_path(exe) if exe else ""
+    company = _ver_company(path) if path and os.path.isfile(path) else ""
+    hit = adware_check(path=path or exe, name=row.get("name") or "", company=company, cmd=cmd)
+    return dict(row, cmd=cmd, path=path, company=company,
+                adware=hit.get("label", "") if hit.get("hit") else "",
+                t=_dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+
+def load_autostart_baseline(path=None):
+    try:
+        with open(path or AUTOSTART_BASELINE, "r", encoding="utf-8") as fp:
+            d = json.load(fp)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def save_autostart_baseline(snap, path=None):
+    try:
+        ensure_dirs()
+        _atomic_write_json(path or AUTOSTART_BASELINE, snap)
+    except Exception as e:
+        log_line("save autostart baseline failed: %r" % (e,))
+
+
+def append_autostart_watch(rows, path=None):
+    if not rows:
+        return
+    p = path or AUTOSTART_WATCH_LOG
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "a", encoding="utf-8") as fp:
+            for r in rows:
+                fp.write(json.dumps(r, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log_line("append autostart watch failed: %r" % (e,))
+
+
+def autostart_watch_log(limit=200, path=None):
+    """新增自启记录，最新在前。"""
+    out = []
+    try:
+        with open(path or AUTOSTART_WATCH_LOG, "r", encoding="utf-8", errors="replace") as fp:
+            for line in fp:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except Exception:
+                        pass
+    except Exception:
+        return []
+    return out[-int(limit):][::-1]
+
+
+class AutostartWatcher(object):
+    """后台线程等系统的变更通知，有变化就把 dirty_at 设成当前时间（由调用方去做快照对比）。
+
+    不用 Qt：守护和测试都能用。所有 RegNotifyChangeKeyValue 都在同一个线程里调——
+    这个 API 的通知挂在调用线程上，线程退出通知就失效。
+    """
+    _REG_WATCH = (
+        (HKCU, r"Software\Microsoft\Windows\CurrentVersion\Run", False),
+        (HKCU, r"Software\Microsoft\Windows\CurrentVersion\RunOnce", False),
+        (HKLM, r"Software\Microsoft\Windows\CurrentVersion\Run", False),
+        (HKLM, r"Software\Microsoft\Windows\CurrentVersion\RunOnce", False),
+        (HKLM, r"Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run", False),
+        (HKCU, _APPROVED_BASE, True),                   # 「禁用」标记被改回启用
+        (HKLM, _APPROVED_BASE, True),
+    )
+
+    def __init__(self, watch_tasks=True):
+        self.dirty_at = 0.0
+        self.watching = []                              # 实际盯上的位置（给界面 / 日志看）
+        self._watch_tasks = watch_tasks
+        self._thread = None
+        self._ready = threading.Event()
+        self._k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._adv = ctypes.WinDLL("advapi32", use_last_error=True)
+        k, a = self._k32, self._adv
+        k.CreateEventW.restype = ctypes.c_void_p
+        k.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]
+        k.SetEvent.argtypes = [ctypes.c_void_p]
+        k.CloseHandle.argtypes = [ctypes.c_void_p]
+        k.WaitForMultipleObjects.restype = ctypes.c_ulong
+        k.WaitForMultipleObjects.argtypes = [ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p),
+                                             ctypes.c_int, ctypes.c_ulong]
+        k.FindFirstChangeNotificationW.restype = ctypes.c_void_p
+        k.FindFirstChangeNotificationW.argtypes = [ctypes.c_wchar_p, ctypes.c_int, ctypes.c_ulong]
+        k.FindNextChangeNotification.argtypes = [ctypes.c_void_p]
+        k.FindCloseChangeNotification.argtypes = [ctypes.c_void_p]
+        a.RegNotifyChangeKeyValue.restype = ctypes.c_long
+        a.RegNotifyChangeKeyValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ulong,
+                                              ctypes.c_void_p, ctypes.c_int]
+        self._stop = k.CreateEventW(None, True, False, None)
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, name="autostart-watch", daemon=True)
+        self._thread.start()
+        self._ready.wait(5)
+        return bool(self.watching)
+
+    def stop(self):
+        if self._stop:
+            self._k32.SetEvent(self._stop)
+        if self._thread:
+            self._thread.join(3)
+
+    def _arm_reg(self, hkey, subtree, ev):
+        flt = 0x1 | 0x4                                 # REG_NOTIFY_CHANGE_NAME | LAST_SET
+        return self._adv.RegNotifyChangeKeyValue(hkey.handle, subtree, flt, ev, True) == 0
+
+    def _run(self):
+        k = self._k32
+        regs, dirs = [], []                              # (PyHKEY, subtree, event) / handle
+        try:
+            for root, sub, subtree in self._REG_WATCH:
+                try:
+                    hk = winreg.OpenKey(root, sub, 0, winreg.KEY_NOTIFY | winreg.KEY_READ)
+                except OSError:
+                    continue
+                ev = k.CreateEventW(None, False, False, None)
+                if ev and self._arm_reg(hk, subtree, ev):
+                    regs.append((hk, subtree, ev))
+                    self.watching.append(("HKCU\\" if root == HKCU else "HKLM\\") + sub)
+                else:
+                    hk.Close()
+            folders = [
+                os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Startup"),
+                os.path.join(os.environ.get("ProgramData", ""), r"Microsoft\Windows\Start Menu\Programs\Startup"),
+            ]
+            if self._watch_tasks:
+                folders.append(TASKS_DIR)
+            for d in folders:
+                if not os.path.isdir(d):
+                    continue
+                h = k.FindFirstChangeNotificationW(d, d == TASKS_DIR, 0x1 | 0x10)  # 文件名 / 写入
+                if h and h != ctypes.c_void_p(-1).value:
+                    dirs.append(h)
+                    self.watching.append(d)
+        finally:
+            self._ready.set()
+        handles = [self._stop] + [ev for _hk, _st, ev in regs] + dirs
+        arr = (ctypes.c_void_p * len(handles))(*handles)
+        try:
+            while True:
+                rc = k.WaitForMultipleObjects(len(handles), arr, False, 0xFFFFFFFF)
+                if rc == 0 or rc >= len(handles):        # 停止，或 WAIT_FAILED
+                    break
+                i = rc - 1
+                if i < len(regs):
+                    hk, st, ev = regs[i]
+                    self._arm_reg(hk, st, ev)            # 通知是一次性的，触发后要重新挂
+                else:
+                    k.FindNextChangeNotification(dirs[i - len(regs)])
+                self.dirty_at = time.time()
+        finally:
+            for hk, _st, ev in regs:
+                k.CloseHandle(ev)
+                hk.Close()
+            for h in dirs:
+                k.FindCloseChangeNotification(h)
+            k.CloseHandle(self._stop)
+            self._stop = None
 
 
 # --------------------------------------------------------------------------
