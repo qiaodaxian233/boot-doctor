@@ -10,6 +10,8 @@ jobs:
   test:
     runs-on: windows-latest
     timeout-minutes: 20
+    permissions:
+      contents: write          # 只用于把界面截图推到 ci-shots 分支
     env:
       QT_QPA_PLATFORM: offscreen
       PYTHONIOENCODING: utf-8
@@ -26,3 +28,19 @@ jobs:
       - name: 体检分段计时
         if: always()
         run: python .github/ci_annotate.py profile python _prof_detail.py
+      - name: 界面截图
+        if: always() && github.event_name == 'push'
+        run: python .github/ci_annotate.py shots python _ui_pages_shot.py
+      - name: 截图推到 ci-shots 分支（每次覆盖，只留最新一次）
+        if: always() && github.event_name == 'push'
+        shell: bash
+        run: |
+          [ -d _ci_shots ] || exit 0
+          cd _ci_shots
+          echo "${GITHUB_REF_NAME} @ ${GITHUB_SHA}" > SOURCE.txt
+          git init -q -b ci-shots
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -q -m "界面截图：${GITHUB_REF_NAME} @ ${GITHUB_SHA::7}"
+          git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" ci-shots
