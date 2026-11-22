@@ -133,3 +133,26 @@ for i in infos:
     r = bc.app_signature(i)
     st[(r["state"], bool(bc.real_microsoft(r)))] = st.get((r["state"], bool(bc.real_microsoft(r))), 0) + 1
 print("  结果分布（状态, 是否认成微软）：%s" % sorted(st.items()))
+
+print("\n[程序启动：打开到第一屏有内容]")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+t = time.perf_counter()
+import boot_doctor as bd  # noqa: E402
+print("  import boot_doctor                         %7.0f ms" % ((time.perf_counter() - t) * 1000))
+from PyQt5.QtWidgets import QApplication  # noqa: E402
+_app = QApplication.instance() or QApplication([])
+t = time.perf_counter()
+_win = bd.MainWindow(autoscan=False)
+print("  构建主窗口 MainWindow()                    %7.0f ms" % ((time.perf_counter() - t) * 1000))
+if isinstance(raw, dict):
+    bc.save_last_scan(raw)
+    t = time.perf_counter()
+    _win._load_cached()
+    print("  读缓存 + 重新分析 + 摆出结果               %7.0f ms   <- 打开后多久能看到上次的结果" % (
+        (time.perf_counter() - t) * 1000))
+    t = time.perf_counter()
+    _r = bc.collect()
+    print("  对比：真实重新体检 collect()              %7.0f ms   <- 以前要等这么久才有内容" % (
+        (time.perf_counter() - t) * 1000))
+_win.close()
+

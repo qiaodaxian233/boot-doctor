@@ -34,12 +34,17 @@ import urllib.request
 import winreg
 
 APP_NAME = "开机体检大师"
-VERSION = "1.9.2"
+VERSION = "2.0.0"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-BACKUP_DIR = os.path.join(BASE_DIR, "_backups")
-LOG_DIR = os.path.join(BASE_DIR, "_logs")
-SETTINGS_PATH = os.path.join(BASE_DIR, "_settings.json")
+# 程序运行时产生的数据（备份 / 日志 / 设置 / 规则 / 快照）放哪里。默认就在程序目录；
+# 设了 BOOTDOC_DATA_DIR 就改放到那里——装在 Program Files 之类不能写的位置时需要，
+# 自动测试也靠它把守护进程的数据隔离到临时目录，不碰真实数据。
+# 特征库 adware_db.json 和守护脚本属于程序本身，不跟着挪。
+DATA_DIR = os.environ.get("BOOTDOC_DATA_DIR") or BASE_DIR
+BACKUP_DIR = os.path.join(DATA_DIR, "_backups")
+LOG_DIR = os.path.join(DATA_DIR, "_logs")
+SETTINGS_PATH = os.path.join(DATA_DIR, "_settings.json")
 
 SEV_CN = {"high": "高", "mid": "中", "low": "低", "info": "提示"}
 SEV_ORDER = {"high": 0, "mid": 1, "low": 2, "info": 3}
@@ -528,7 +533,7 @@ def enum_extra_autostarts():
 # 采集 1c：启动项快照（用于「装完软件多了什么」对比）
 # --------------------------------------------------------------------------
 
-SNAPSHOT_DIR = os.path.join(BASE_DIR, "_snapshots")
+SNAPSHOT_DIR = os.path.join(DATA_DIR, "_snapshots")
 
 
 def snapshot_path(ts=None):
@@ -930,10 +935,11 @@ def merge_adware_db(old, parsed):
     }
 
 
-def _atomic_write_json(path, obj):
+def _atomic_write_json(path, obj, indent=1):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fp:
-        json.dump(obj, fp, ensure_ascii=False, indent=1)
+        json.dump(obj, fp, ensure_ascii=False, indent=indent,
+                  separators=None if indent else (",", ":"))
         fp.flush()
         try:
             os.fsync(fp.fileno())
@@ -1466,7 +1472,7 @@ def adware_summary(res):
 
 _W = ctypes.windll.user32
 _K = ctypes.windll.kernel32
-POPUP_RULES_PATH = os.path.join(BASE_DIR, "_popup_rules.json")
+POPUP_RULES_PATH = os.path.join(DATA_DIR, "_popup_rules.json")
 GUARD_PID_PATH = os.path.join(LOG_DIR, "popup_guard.pid")
 GUARD_STOP_PATH = os.path.join(LOG_DIR, "popup_guard.stop")
 GUARD_SCRIPT = os.path.join(BASE_DIR, "popup_guard.py")
@@ -2039,7 +2045,7 @@ def start_popup_guard(progress=None):
     except Exception as e:
         log_line("start popup guard failed: %r" % (e,))
         return False, "启动失败：%s" % e
-    for _ in range(30):                      # 最多等 3 秒写 pid
+    for _ in range(80):                      # 最多等 8 秒写 pid（冷启动时 Python + Qt 导入就要 1~2 秒）
         time.sleep(0.1)
         if guard_running():
             log_line("popup guard started pid=%d" % guard_pid())
@@ -3674,6 +3680,54 @@ def collect(progress=None, should_stop=None):
         raise ScanCancelled()
     P("采集完成，开始分析 …")
     return raw
+
+
+# --------------------------------------------------------------------------
+# 上次体检结果缓存：打开程序先显示它，后台再刷新
+#
+# 存的是采集到的原始数据 raw，不是分析结果：分析规则会随版本升级，
+# 用新版本的 analyze 重新分析旧数据，永远不会显示过时的判断。
+# --------------------------------------------------------------------------
+def last_scan_path():
+    return os.path.join(LOG_DIR, "last_scan.json")
+
+
+def save_last_scan(raw, path=None):
+    """体检完成后存一份（原子写，不会写出半截文件）。返回是否成功。"""
+    try:
+        ensure_dirs()
+        _atomic_write_json(path or last_scan_path(),
+                           {"saved": time.time(), "version": VERSION, "raw": raw}, indent=None)
+        return True
+    except Exception as e:
+        log_line("save_last_scan failed: %r" % (e,))
+        return False
+
+
+def load_last_scan(path=None, max_age_days=14):
+    """读上次体检的原始数据：返回 (raw, 保存时间戳)，没有 / 太旧 / 损坏返回 (None, 0.0)。"""
+    try:
+        with open(path or last_scan_path(), "r", encoding="utf-8") as fp:
+            d = json.load(fp)
+        raw, saved = d["raw"], float(d["saved"])
+        if not isinstance(raw, dict) or not all(k in raw for k in ("startup", "services", "sys")):
+            return None, 0.0
+        if time.time() - saved > max_age_days * 86400:
+            return None, 0.0
+        return raw, saved
+    except Exception:
+        return None, 0.0
+
+
+def age_text(seconds):
+    s_ = max(0, int(seconds))
+    if s_ < 90:
+        return "刚刚"
+    if s_ < 3600:
+        return "%d 分钟前" % (s_ // 60)
+    if s_ < 86400:
+        return "%d 小时前" % (s_ // 3600)
+    return "%d 天前" % (s_ // 86400)
 
 
 # --------------------------------------------------------------------------

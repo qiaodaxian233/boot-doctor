@@ -31,7 +31,7 @@ from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPixmap  # noqa: E402
 from PyQt5.QtWidgets import (QAction, QApplication, QMenu, QMessageBox,  # noqa: E402
                              QSystemTrayIcon)
 
-GL = os.path.join(HERE, "_logs", "popup_guard.log")
+GL = os.path.join(bc.LOG_DIR, "popup_guard.log")
 WM_CLOSE = 0x0010
 ERROR_ACCESS_DENIED = 5
 ERROR_ALREADY_EXISTS = 183
@@ -116,6 +116,13 @@ class Guard(QApplication):
             glog("拦截已关闭（enabled=false），本次静默退出")
             raise SystemExit(0)
 
+        # pid 文件第一时间写：主程序靠它判断「守护起来了没有」。以前写在自启监控初始化之后，
+        # 慢一点的机器上主程序等不到就报「守护进程没起来」，其实它几秒后就起来了
+        try:
+            bc.write_guard_pid()
+        except Exception:
+            pass
+
         self.tray = QSystemTrayIcon(make_icon(), self)
         self.tray.setToolTip("弹窗拦截 · 守护中")
         self.menu = QMenu()
@@ -175,12 +182,9 @@ class Guard(QApplication):
         self.as_timer.timeout.connect(self.check_autostart)
         self.as_full_at = 0.0
         if self.rules.get("watch_autostart", True):
-            self.start_autostart_watch()
+            # 拦截先开始工作；自启监控要拍快照、挂一批变更通知，稍后再启动，别拖慢「开始拦截」
+            QTimer.singleShot(400, self.start_autostart_watch)
 
-        try:
-            bc.write_guard_pid()
-        except Exception:
-            pass
         self.update_tip()
         glog("守护启动 pid=%d 管理员=%s 事件钩子=%s 规则 block=%d allow=%d auto=%s"
              % (os.getpid(), bc.is_admin(), "on" if self._hook else "off(轮询)",
